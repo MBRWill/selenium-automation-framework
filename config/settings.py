@@ -18,7 +18,7 @@ version:    24.12.29.12.30
 # >>>>>>>>>>> LinkedIn Settings <<<<<<<<<<<
 
 # Keep the External Application tabs open?
-close_tabs = False                  # True or False, Note: True or False are case-sensitive
+close_tabs = True                  # True or False, Note: True or False are case-sensitive
 '''
 Note: RECOMMENDED TO LEAVE IT AS `True`, if you set it `False`, be sure to CLOSE ALL TABS BEFORE CLOSING THE BROWSER!!!
 '''
@@ -39,7 +39,7 @@ run_non_stop = False                # True or False, Note: True or False are cas
 Note: Will be treated as False if `run_in_background = True`
 '''
 alternate_sortby = True             # True or False, Note: True or False are case-sensitive
-cycle_date_posted = True            # True or False, Note: True or False are case-sensitive
+cycle_date_posted = True           # True or False, Note: True or False are case-sensitive
 stop_date_cycle_at_24hr = True      # True or False, Note: True or False are case-sensitive
 
 
@@ -62,8 +62,9 @@ file_name = "all excels/all_applied_applications_history.csv"
 failed_file_name = "all excels/all_failed_applications_history.csv"
 logs_folder_path = "logs/"
 
+from random import uniform
 # Set the maximum amount of time allowed to wait between each click in secs
-click_gap = 0                       # Enter max allowed secs to wait approximately. (Only Non Negative Integers Eg: 0,1,2,3,....)
+click_gap = 1                  # Enter max allowed secs to wait approximately. (Only Non Negative Integers Eg: 0,1,2,3,....)
 
 # If you want to see Chrome running then set run_in_background as False (May reduce performance). 
 run_in_background = False           # True or False, Note: True or False are case-sensitive ,   If True, this will make pause_at_failed_question, pause_before_submit and run_in_background as False
@@ -80,8 +81,19 @@ smooth_scroll = False               # True or False, Note: True or False are cas
 # If enabled (True), the program would keep your screen active and prevent PC from sleeping. Instead you could disable this feature (set it to false) and adjust your PC sleep settings to Never Sleep or a preferred time. 
 keep_screen_awake = True            # True or False, Note: True or False are case-sensitive (Note: Will temporarily deactivate when any application dialog boxes are present (Eg: Pause before submit, Help needed for a question..))
 
+#kkkkkk
+# Pause after the search filters are applied to let user confirm results
+pause_after_filters = True
+
+# Pause before final submit on Easy Apply
+pause_before_submit = False
+
+# Pause when bot can't answer a question (manual intervention)
+pause_at_failed_question = False
+#kkkkk
+
 # Run in undetected mode to bypass anti-bot protections (Preview Feature, UNSTABLE. Recommended to leave it as False)
-stealth_mode = True                 # True or False, Note: True or False are case-sensitive
+stealth_mode = False                # True or False, Note: True or False are case-sensitive
 
 # Do you want to get alerts on errors related to AI API connection?
 showAiErrorAlerts = True            # True or False, Note: True or False are case-sensitive

@@ -43,6 +43,11 @@ from modules.ai.openaiConnections import *
 
 from typing import Literal
 
+# #kkkkkkkk
+# import config.settings as _settings
+# print_lg(f"[DEBUG] settings loaded from: {_settings.__file__}")
+# print_lg(f"[DEBUG] pause_after_filters={pause_after_filters}, switch_number={switch_number}, run_in_background={run_in_background}, run_non_stop={run_non_stop}")
+# #kkkkkkkk
 
 pyautogui.FAILSAFE = False
 # if use_resume_generator:    from resume_generator import is_logged_in_GPT, login_GPT, open_resume_chat, create_custom_resume
@@ -85,6 +90,11 @@ notice_period_weeks = str(notice_period//7)
 notice_period = str(notice_period)
 
 aiClient = None
+##> ------ Dheeraj Deshwal : dheeraj9811 Email:dheeraj20194@iiitd.ac.in/dheerajdeshwal9811@gmail.com - Feature ------
+about_company_for_ai = None # TODO extract about company for AI
+##<
+
+
 #>
 
 
@@ -200,12 +210,12 @@ def apply_filters() -> None:
         wait_span_click(driver, date_posted)
         buffer(recommended_wait)
 
-        multi_sel(driver, experience_level) 
+        multi_sel_noWait(driver, experience_level) 
         multi_sel_noWait(driver, companies, actions)
         if experience_level or companies: buffer(recommended_wait)
 
-        multi_sel(driver, job_type)
-        multi_sel(driver, on_site)
+        multi_sel_noWait(driver, job_type)
+        multi_sel_noWait(driver, on_site)
         if job_type or on_site: buffer(recommended_wait)
 
         if easy_apply_only: boolean_button_click(driver, actions, "Easy Apply")
@@ -234,7 +244,7 @@ def apply_filters() -> None:
 
         global pause_after_filters
         if pause_after_filters and "Turn off Pause after search" == pyautogui.confirm("These are your configured search results and filter. It is safe to change them while this dialog is open, any changes later could result in errors and skipping this search run.", "Please check your results", ["Turn off Pause after search", "Look's good, Continue"]):
-            pause_after_filters = False
+            pause_after_filters = True
 
     except Exception as e:
         print_lg("Setting the preferences failed!")
@@ -272,7 +282,15 @@ def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_j
     '''
     job_details_button = job.find_element(By.TAG_NAME, 'a')  # job.find_element(By.CLASS_NAME, "job-card-list__title")  # Problem in India
     scroll_to_view(driver, job_details_button, True)
-    job_id = job.get_dom_attribute('data-occludable-job-id')
+    #Jinhao
+    try:
+        inner_div = job.find_element(By.XPATH, ".//div[contains(@class, 'job-card-container--clickable')]")
+        job_id = inner_div.get_attribute("data-job-id")
+    except Exception as e:
+        print(f"⚠️ Failed to get job_id: {e}")
+        job_id = "unknown"
+    #CR:Jinhao
+    #job_id = job.get_dom_attribute('data-occludable-job-id')
     title = job_details_button.text
     title = title[:title.find("\n")]
     # company = job.find_element(By.CLASS_NAME, "job-card-container__primary-description").text
@@ -363,7 +381,10 @@ def get_job_description(
     - `skipMessage: str | None`
     '''
     try:
+        ##> ------ Dheeraj Deshwal : dheeraj9811 Email:dheeraj20194@iiitd.ac.in/dheerajdeshwal9811@gmail.com - Feature ------
         jobDescription = "Unknown"
+        ##<
+
         experience_required = "Unknown"
         found_masters = 0
         jobDescription = find_by_class(driver, "jobs-box__html-content").text
@@ -410,12 +431,14 @@ def upload_resume(modal: WebElement, resume: str) -> tuple[bool, str]:
 
 # Function to answer common questions for Easy Apply
 def answer_common_questions(label: str, answer: str) -> str:
+
     if 'sponsorship' in label or 'visa' in label: answer = require_visa
     return answer
 
 
 # Function to answer the questions for Easy Apply
-def answer_questions(modal: WebElement, questions_list: set, work_location: str) -> set:
+def answer_questions(modal: WebElement, questions_list: set, work_location: str, job_description: str | None = None ) -> set:
+
     # Get all questions from the page
      
     all_questions = modal.find_elements(By.XPATH, ".//div[@data-test-form-element]")
@@ -435,6 +458,7 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str)
             except: pass
             answer = 'Yes'
             label = label_org.lower()
+
             select = Select(select)
             selected_option = select.first_selected_option.text
             optionsText = []
@@ -443,11 +467,23 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str)
                 optionsText = [option.text for option in select.options]
                 options = "".join([f' "{option}",' for option in optionsText])
             prev_answer = selected_option
-            if overwrite_previous_answers or selected_option == "Select an option":
+
+            if overwrite_previous_answers or selected_option in ["Select an option","Selecciona una opción"]:
                 if 'email' in label or 'phone' in label: answer = prev_answer
                 elif 'gender' in label or 'sex' in label: answer = gender
+                #yes/no exp
+                # elif 'experiencia' in label: answer = 'yes'
+                # elif 'Tienes' in label or 'tienes' in label or 'has' in label: answer = 'yes'
+                elif any(word in label.lower() for word in ['experiencia', 'tienes', 'has']):
+                    answer = "Sí" if "Sí" in optionsText else "Yes"  # Handle Spanish "Sí"
                 elif 'disability' in label: answer = disability_status
-                elif 'proficiency' in label: answer = 'Professional'
+                elif 'proficiency' in label: answer = (
+                    'Nativo o bilingüe' if 'Nativo o bilingüe' in optionsText
+                    else ('Native or bilingual' if 'Native or bilingual' in optionsText 
+                          else 'Professional')
+                )
+                #english level 
+                elif 'nivel' in label and 'ingl' in label: answer = 'Nativo o bilingüe' if 'Nativo o bilingüe' in optionsText else 'Native or bilingual'
                 else: answer = answer_common_questions(label,answer)
                 try: select.select_by_visible_text(answer)
                 except NoSuchElementException as e:
@@ -462,6 +498,8 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str)
                                 break
                         if foundOption: break
                     if not foundOption:
+                        #TODO: Use AI to answer the question need to be implemented logic to extract the options for the question
+
                         print_lg(f'Failed to find an option with text "{answer}" for question labelled "{label_org}", answering randomly!')
                         select.select_by_index(randint(1, len(select.options)-1))
                         answer = select.first_selected_option.text
@@ -492,7 +530,7 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str)
                 label_org += f' {options_labels[-1]},'
 
             if overwrite_previous_answers or prev_answer is None:
-                if 'citizenship' in label or 'employment eligibility' in label: answer = us_citizenship
+                if 'citizenship' in label or 'employment eligibility' or 'Work Permit' in label: answer = us_citizenship
                 elif 'veteran' in label or 'protected' in label: answer = veteran_status
                 elif 'disability' in label or 'handicapped' in label: 
                     answer = disability_status
@@ -539,7 +577,11 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str)
 
             prev_answer = text.get_attribute("value")
             if not prev_answer or overwrite_previous_answers:
-                if 'experience' in label or 'years' in label: answer = years_of_experience
+                if 'experience' in label or 'years' in label or 'experiencia' in label: answer = years_of_experience
+                #yes/no exp
+                #############################################################
+                ##############################################################################
+                elif 'earliest' in label or 'date' in label: answer = earliest_start_date
                 elif 'phone' in label or 'mobile' in label: answer = phone_number
                 elif 'street' in label: answer = street
                 elif 'city' in label or 'location' in label or 'address' in label:
@@ -559,7 +601,8 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str)
                     elif 'week' in label:
                         answer = notice_period_weeks
                     else: answer = notice_period
-                elif 'salary' in label or 'compensation' in label or 'ctc' in label or 'pay' in label: 
+                    #expected salary.      
+                elif 'salary' in label or 'compensation' in label or 'ctc' in label or 'pay' in label or 'expectativas' in label or 'salariales' in label or 'salarial' in label: 
                     if 'current' in label or 'present' in label:
                         if 'month' in label:
                             answer = current_ctc_monthly
@@ -583,9 +626,19 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str)
                 elif 'zip' in label or 'postal' in label or 'code' in label: answer = zipcode
                 elif 'country' in label: answer = country
                 else: answer = answer_common_questions(label,answer)
+                ##> ------ Dheeraj Deshwal : dheeraj9811 Email:dheeraj20194@iiitd.ac.in/dheerajdeshwal9811@gmail.com - Feature ------
+
                 if answer == "":
-                    randomly_answered_questions.add((label_org, "text"))
-                    answer = years_of_experience
+                    if use_AI and aiClient:
+                        try:
+                             answer = ai_answer_question(aiClient, label_org, question_type="text" ,job_description=job_description, user_information_all = user_information_all)
+                             print_lg(f'AI Answered recived for question"{label_org}" \nhere is answer : "{answer}"')
+                        except Exception as e:
+                            print_lg("Failed to get AI answer!", e)
+                    else:
+                        randomly_answered_questions.add((label_org, "text"))
+                        answer = years_of_experience
+                 ##< 
                 text.clear()
                 text.send_keys(answer)
                 if do_actions:
@@ -606,11 +659,24 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str)
             if not prev_answer or overwrite_previous_answers:
                 if 'summary' in label: answer = linkedin_summary
                 elif 'cover' in label: answer = cover_letter
-                text_area.clear()
-                text_area.send_keys(answer)
-                if answer == "": 
-                    randomly_answered_questions.add((label_org, "textarea"))
+                if answer == "":
+                ##> ------ Dheeraj Deshwal : dheeraj9811 Email:dheeraj20194@iiitd.ac.in/dheerajdeshwal9811@gmail.com - Feature ------
+                    if use_AI and aiClient:
+                        try:
+                             answer = ai_answer_question(aiClient, label_org, question_type="textarea" ,job_description=job_description, user_information_all = user_information_all)
+                             print_lg(f'AI Answered recived for question"{label_org}" \nhere is answer : "{answer}"')
+                        except Exception as e:
+                            print_lg("Failed to get AI answer!", e)
+                    else:
+                        randomly_answered_questions.add((label_org, "textarea"))
+            text_area.clear()
+            text_area.send_keys(answer)
+            if do_actions:
+                    sleep(2)
+                    actions.send_keys(Keys.ARROW_DOWN)
+                    actions.send_keys(Keys.ENTER).perform()
             questions_list.add((label, text_area.get_attribute("value"), "textarea", prev_answer))
+            ##<
             continue
 
         # Check if it's a checkbox question
@@ -777,13 +843,14 @@ def apply_to_jobs(search_terms: list[str]) -> None:
         try:
             while current_count < switch_number:
                 # Wait until job listings are loaded
-                wait.until(EC.presence_of_all_elements_located((By.XPATH, "//li[@data-occludable-job-id]")))
+                #CR:Jinhao
+                wait.until(EC.presence_of_all_elements_located((By.XPATH, "//li[contains(@class, 'occludable-update')]")))
 
                 pagination_element, current_page = get_page_info()
 
                 # Find all job listings in current page
                 buffer(3)
-                job_listings = driver.find_elements(By.XPATH, "//li[@data-occludable-job-id]")  
+                job_listings = driver.find_elements(By.XPATH, "//li[contains(@class, 'occludable-update')]")  
 
             
                 for job in job_listings:
@@ -906,11 +973,14 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                         screenshot_name = screenshot(driver, job_id, "Failed at questions")
                                         errored = "stuck"
                                         raise Exception("Seems like stuck in a continuous loop of next, probably because of new questions.")
-                                    questions_list = answer_questions(modal, questions_list, work_location)
+                                    questions_list = answer_questions(modal, questions_list, work_location, job_description=description)
+
                                     if useNewResume and not uploaded: uploaded, resume = upload_resume(modal, default_resume_path)
                                     try: next_button = modal.find_element(By.XPATH, './/span[normalize-space(.)="Review"]') 
                                     except NoSuchElementException:  next_button = modal.find_element(By.XPATH, './/button[contains(span, "Next")]')
-                                    try: next_button.click()
+                                    try: 
+                                        next_button.click()
+
                                     except ElementClickInterceptedException: break    # Happens when it tries to click Next button in About Company photos section
                                     buffer(click_gap)
 
@@ -964,20 +1034,49 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     if application_link == "Easy Applied": easy_applied_count += 1
                     else:   external_jobs_count += 1
                     applied_jobs.add(job_id)
+                
+                # Pause update---
+                # --- Anti-rate-limit pause between applications ---
+                    from random import uniform
+                    pause_duration = round(uniform(15, 25), 2)  # 5–12 s random delay
+                    print_lg(f"🕒 Pausing {pause_duration}s before next application to mimic human rhythm...")
+                    sleep(pause_duration)
+                # from random import uniform
+                # sleep(uniform(1, 5))   # wait 5–10 seconds between applications
+                # print_lg(f"🕒 Short pause between applications to mimic human behavior...")
 
 
 
                 # Switching to next page
-                if pagination_element == None:
-                    print_lg("Couldn't find pagination element, probably at the end page of results!")
-                    break
+                # if pagination_element == None:
+                #     print_lg("Couldn't find pagination element, probably at the end page of results!")
+                #     break
+                # try:
+                #     pagination_element.find_element(By.XPATH, f"//button[@aria-label='Page {current_page+1}']").click()
+                #     print_lg(f"\n>-> Now on Page {current_page+1} \n")
+                # except NoSuchElementException:
+                #     print_lg(f"\n>-> Didn't find Page {current_page+1}. Probably at the end page of results!\n")
+                #     break# Switching to next page
+                    
+                   # Switching to the next page
+                # Switching to next page
                 try:
-                    pagination_element.find_element(By.XPATH, f"//button[@aria-label='Page {current_page+1}']").click()
-                    print_lg(f"\n>-> Now on Page {current_page+1} \n")
+                    next_button = driver.find_element(By.XPATH, "//button[contains(@class, 'jobs-search-pagination__button--next') and @aria-label='View next page']")
+                    
+                    if "artdeco-button--disabled" in next_button.get_attribute("class"):
+                        print_lg("\n>-> 'Next' button is disabled. Reached the last page!\n")
+                        break 
+                    
+                    driver.execute_script("arguments[0].scrollIntoView();", next_button)  # Ensure it's in view
+                    sleep(1)  # Small delay for stability
+                    next_button.click()
+                    
+                    print_lg("\n>-> Clicked 'Next' button. Moving to the next page...\n")
+                    sleep(3)  # Allow time for page to load
                 except NoSuchElementException:
-                    print_lg(f"\n>-> Didn't find Page {current_page+1}. Probably at the end page of results!\n")
+                    print_lg("\n⚠️ 'Next' button not found. Stopping pagination.\n")
                     break
-
+            
         except Exception as e:
             print_lg("Failed to find Job listings!")
             critical_error_log("In Applier", e)
@@ -996,9 +1095,9 @@ def run(total_runs: int) -> int:
     print_lg("########################################################################################################################\n")
     if not dailyEasyApplyLimitReached:
         print_lg("Sleeping for 10 min...")
-        sleep(300)
+        sleep(10)
         print_lg("Few more min... Gonna start with in next 5 min...")
-        sleep(300)
+        sleep(10)
     buffer(3)
     return total_runs + 1
 

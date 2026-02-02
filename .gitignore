@@ -1,13 +1,25 @@
+.DS_Store
+**/.DS_Store
+.venv_bad_20260108_221731/
+venv_bad_20260108_221731/
+
 __pycache__
 .vscode
 
-all excels
-all resumes
-logs
+all_excels/
+all_resumes/
 
-old
+logs/
+*.log
+
+old/
 
 secrets.py
 config/personals.py
-.venv
 apikeys.py
+
+.venv/
+venv/
+
+*.csv
+
