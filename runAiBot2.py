@@ -23,6 +23,7 @@ from random import choice, shuffle, randint
 from datetime import datetime
 
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support.select import Select
@@ -99,17 +100,77 @@ about_company_for_ai = None # TODO extract about company for AI
 
 
 #< Login Functions
+# def is_logged_in_LN() -> bool:
+#     '''
+#     Function to check if user is logged-in in LinkedIn
+#     * Returns: `True` if user is logged-in or `False` if not
+#     '''
+#     if driver.current_url == "https://www.linkedin.com/feed/": return True
+#     if try_linkText(driver, "Sign in"): return False
+#     if try_xp(driver, '//button[@type="submit" and contains(text(), "Sign in")]'):  return False
+#     if try_linkText(driver, "Join now"): return False
+#     print_lg("Didn't find Sign in link, so assuming user is logged in!")
+#     return True
 def is_logged_in_LN() -> bool:
     '''
-    Function to check if user is logged-in in LinkedIn
-    * Returns: `True` if user is logged-in or `False` if not
+    Strict login check.
+    Never assume logged in just because Sign in link is missing.
     '''
-    if driver.current_url == "https://www.linkedin.com/feed/": return True
-    if try_linkText(driver, "Sign in"): return False
-    if try_xp(driver, '//button[@type="submit" and contains(text(), "Sign in")]'):  return False
-    if try_linkText(driver, "Join now"): return False
-    print_lg("Didn't find Sign in link, so assuming user is logged in!")
-    return True
+    try:
+        driver.get("https://www.linkedin.com/feed/")
+        sleep(3)
+
+        current_url = driver.current_url.lower()
+        page = driver.page_source.lower()
+
+        print_lg(f"DEBUG login check url: {driver.current_url}")
+
+        # Clearly logged out / login page
+        if "login" in current_url or "signup" in current_url:
+            print_lg("DEBUG: login check failed - redirected to login/signup.")
+            return False
+
+        # LinkedIn guest pages / auth wall / anonymous pages
+        if "authwall" in current_url or "trk=public" in current_url:
+            print_lg("DEBUG: login check failed - guest/authwall page.")
+            return False
+
+        # Login words in English or Spanish
+        logged_out_words = [
+            "sign in",
+            "join now",
+            "forgot password",
+            "iniciar sesión",
+            "únete ahora",
+            "has olvidado tu contraseña",
+            "regístrate",
+        ]
+
+        if any(word in page for word in logged_out_words):
+            print_lg("DEBUG: login check failed - logged out text detected.")
+            return False
+
+        # Strong logged-in indicators
+        logged_in_words = [
+            "start a post",
+            "crear publicación",
+            "mi red",
+            "messaging",
+            "mensajes",
+            "notifications",
+            "notificaciones",
+        ]
+
+        if "/feed" in current_url and any(word in page for word in logged_in_words):
+            print_lg("DEBUG: login check passed - feed and logged-in UI detected.")
+            return True
+
+        print_lg("DEBUG: login check uncertain. Treating as NOT logged in.")
+        return False
+
+    except Exception as e:
+        print_lg("DEBUG: login check exception. Treating as NOT logged in.", e)
+        return False
 
 
 def login_LN() -> None:
@@ -122,19 +183,59 @@ def login_LN() -> None:
     # Find the username and password fields and fill them with user credentials
     driver.get("https://www.linkedin.com/login")
     try:
-        wait.until(EC.presence_of_element_located((By.LINK_TEXT, "Forgot password?")))
-        try:
-            text_input_by_ID(driver, "username", username, 1)
-        except Exception as e:
-            print_lg("Couldn't find username field.")
-            # print_lg(e)
-        try:
-            text_input_by_ID(driver, "password", password, 1)
-        except Exception as e:
-            print_lg("Couldn't find password field.")
-            # print_lg(e)
-        # Find the login submit button and click it
-        driver.find_element(By.XPATH, '//button[@type="submit" and contains(text(), "Sign in")]').click()
+        # wait.until(EC.presence_of_element_located((By.LINK_TEXT, "Forgot password?")))
+        # try:
+        #     text_input_by_ID(driver, "username", username, 1)
+        # except Exception as e:
+        #     print_lg("Couldn't find username field.")
+        #     # print_lg(e)
+        # try:
+        #     text_input_by_ID(driver, "password", password, 1)
+        # except Exception as e:
+        #     print_lg("Couldn't find password field.")
+        #     # print_lg(e)
+        # # Find the login submit button and click it
+        # driver.find_element(By.XPATH, '//button[@type="submit" and contains(text(), "Sign in")]').click()
+        wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//input[@type='email' and contains(@autocomplete, 'username')]")
+            )
+        )
+
+        username_field = next(
+            el for el in driver.find_elements(
+                By.XPATH,
+                "//input[@type='email' and contains(@autocomplete, 'username')]"
+            )
+            if el.is_displayed() and el.is_enabled()
+        )
+
+        password_field = next(
+            el for el in driver.find_elements(
+                By.XPATH,
+                "//input[@type='password' and @autocomplete='current-password']"
+            )
+            if el.is_displayed() and el.is_enabled()
+        )
+
+        username_field.click()
+        username_field.clear()
+        username_field.send_keys(username)
+
+        password_field.click()
+        password_field.clear()
+        password_field.send_keys(password)
+
+        sleep(1)
+        password_field.send_keys(Keys.ENTER)
+        sleep(8)
+
+        pyautogui.alert(
+            "Please check the LinkedIn window now.\n\n"
+            "If LinkedIn asks for verification, captcha, email code, or checkpoint, finish it manually.\n\n"
+            "Only click OK after you can see the LinkedIn home/feed page.",
+            "Finish LinkedIn Login"
+        )
     except Exception as e1:
         try:
             profile_button = find_by_class(driver, "profile__details")
