@@ -347,28 +347,70 @@ def apply_filters() -> None:
         # global pause_after_filters
         # if pause_after_filters and "Turn off Pause after search" == pyautogui.confirm("These are your configured search results and filter. It is safe to change them while this dialog is open, any changes later could result in errors and skipping this search run.", "Please check your results", ["Turn off Pause after search", "Look's good, Continue"]):
         #     pause_after_filters = True
+        # print_lg("DEBUG: trying to find Show results button")
+        # print_lg("DEBUG: listing buttons before Show results search")
+        # buttons = driver.find_elements(By.TAG_NAME, "button")
+        # for i, b in enumerate(buttons):
+        #     try:
+        #         txt = b.text
+        #         aria = b.get_attribute("aria-label")
+        #         cls = b.get_attribute("class")
+        #         displayed = b.is_displayed()
+        #         enabled = b.is_enabled()
+        #         print_lg(f"DEBUG BUTTON {i}: text=[{txt}] aria=[{aria}] displayed={displayed} enabled={enabled} class=[{cls}]")
+        #     except Exception as e:
+        #         print_lg(f"DEBUG BUTTON {i}: failed to inspect button: {e}")
+        # show_results_button: WebElement = driver.find_element(
+        #     By.XPATH,
+        #     '//button[contains(@aria-label, "Apply current filters to show") or contains(@aria-label, "Mostrar")]'
+        # )
+
+        # print_lg("DEBUG: Show results button found, clicking")
+        # show_results_button.click()
+
+        # sleep(3)
+
+        # global pause_after_filters
+        # print_lg(f"DEBUG: pause_after_filters = {pause_after_filters}")
+
+        # if pause_after_filters:
+        #     print_lg("DEBUG: showing pause_after_filters dialog")
+
+        #     decision = pyautogui.confirm(
+        #         "Please check the LinkedIn search results now.\n\n"
+        #         "You can manually adjust filters while this dialog is open.\n\n"
+        #         "Click Continue when the search results look good.",
+        #         "Pause after search",
+        #         ["Turn off Pause after search", "Continue"]
+        #     )
+
+        #     print_lg(f"DEBUG: pause dialog decision = {decision}")
+
+        #     if decision == "Turn off Pause after search":
+        #         pause_after_filters = False
         print_lg("DEBUG: trying to find Show results button")
-        print_lg("DEBUG: listing buttons before Show results search")
-        buttons = driver.find_elements(By.TAG_NAME, "button")
-        for i, b in enumerate(buttons):
-            try:
-                txt = b.text
-                aria = b.get_attribute("aria-label")
-                cls = b.get_attribute("class")
-                displayed = b.is_displayed()
-                enabled = b.is_enabled()
-                print_lg(f"DEBUG BUTTON {i}: text=[{txt}] aria=[{aria}] displayed={displayed} enabled={enabled} class=[{cls}]")
-            except Exception as e:
-                print_lg(f"DEBUG BUTTON {i}: failed to inspect button: {e}")
-        show_results_button: WebElement = driver.find_element(
-            By.XPATH,
-            '//button[contains(@aria-label, "Apply current filters to show") or contains(@aria-label, "Mostrar")]'
-        )
 
-        print_lg("DEBUG: Show results button found, clicking")
-        show_results_button.click()
+        try:
+            show_results_button: WebElement = driver.find_element(
+                By.XPATH,
+                "//button["
+                "contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚ', 'abcdefghijklmnopqrstuvwxyzáéíóú'), 'show') "
+                "or contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚ', 'abcdefghijklmnopqrstuvwxyzáéíóú'), 'mostrar') "
+                "or contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚ', 'abcdefghijklmnopqrstuvwxyzáéíóú'), 'result') "
+                "or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚ', 'abcdefghijklmnopqrstuvwxyzáéíóú'), 'show') "
+                "or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚ', 'abcdefghijklmnopqrstuvwxyzáéíóú'), 'mostrar') "
+                "or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚ', 'abcdefghijklmnopqrstuvwxyzáéíóú'), 'result')"
+                "]"
+            )
 
-        sleep(3)
+            print_lg("DEBUG: Show results button found, clicking")
+            show_results_button.click()
+            sleep(3)
+
+        except Exception as e:
+            print_lg("DEBUG: Show results button not found or not clickable.")
+            print_lg(e)
+            print_lg("DEBUG: continuing to manual pause anyway.")
 
         global pause_after_filters
         print_lg(f"DEBUG: pause_after_filters = {pause_after_filters}")
@@ -391,7 +433,7 @@ def apply_filters() -> None:
 
     except Exception as e:
         print_lg("Setting the preferences failed!")
-        # print_lg(e)
+        print_lg(e)
 
 
 
@@ -447,6 +489,29 @@ def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_j
     
     # Skip if previously rejected due to blacklist or already applied
     skip = False
+   
+    # Skip jobs that were manually dismissed/hidden from the LinkedIn results list
+    try:
+        card_text = job.text.lower()
+        card_html = job.get_attribute("innerHTML").lower()
+
+        if (
+           "job-card-list--is-dismissed" in card_html
+
+            or "we won’t show you this job again" in card_text
+
+            or "we won't show you this job again" in card_text
+
+            or "was dismissed" in card_text
+
+            or "deshacer" in card_text
+        ):
+            print_lg(f'Skipping manually dismissed/hidden job "{title} | {company}". Job ID: {job_id}!')
+            skip = True
+
+    except Exception as e:
+        print_lg("Could not check whether job card was dismissed/hidden.")
+        print_lg(e)
     if company in blacklisted_companies:
         print_lg(f'Skipping "{title} | {company}" job (Blacklisted Company). Job ID: {job_id}!')
         skip = True
