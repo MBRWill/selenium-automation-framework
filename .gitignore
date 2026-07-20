@@ -15,6 +15,7 @@ logs/
 old/
 
 secrets.py
+config/secrets.py
 config/personals.py
 apikeys.py
 
@@ -23,3 +24,5 @@ venv/
 
 *.csv
 
+.env
+.env.*
