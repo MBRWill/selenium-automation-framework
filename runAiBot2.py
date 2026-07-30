@@ -18,8 +18,10 @@ import os
 import csv
 import re
 import pyautogui
+import unicodedata
+from decimal import Decimal, InvalidOperation
 
-from random import choice, shuffle, randint
+from random import choice, shuffle
 from datetime import datetime
 
 from selenium.webdriver.common.by import By
@@ -41,6 +43,14 @@ from modules.helpers import *
 from modules.clickers_and_finders import *
 from modules.validator import validate_config
 from modules.ai.openaiConnections import *
+from modules.ai.answer_review_queue import AIAnswerReviewQueue
+from modules.ai.gemini_unknown_question import (
+    answer_deterministic_question,
+    answer_unknown_question,
+    answer_verified_question,
+    is_experience_capability_question,
+    is_citizenship_question,
+)
 
 from typing import Literal
 
@@ -91,6 +101,8 @@ notice_period_weeks = str(notice_period//7)
 notice_period = str(notice_period)
 
 aiClient = None
+ai_answer_review_queue = None
+ai_review_context = {}
 ##> ------ Dheeraj Deshwal : dheeraj9811 Email:dheeraj20194@iiitd.ac.in/dheerajdeshwal9811@gmail.com - Feature ------
 about_company_for_ai = None # TODO extract about company for AI
 ##<
@@ -528,8 +540,10 @@ def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_j
     except Exception as e:
         print_lg(f'Failed to click "{title} | {company}" job on details button. Job ID: {job_id}!') 
         # print_lg(e)
-        discard_job()
-        job_details_button.click() # To pass the error outside
+        cleanup_result = _guard_next_job_click(driver, job_id)
+        if not cleanup_result["success"]:
+            raise RuntimeError("easy_apply_modal_cleanup_failed")
+        job_details_button.click() # To pass non-modal click errors outside
     buffer(click_gap)
     return (job_id,title,company,work_location,work_style,skip)
 
@@ -639,13 +653,1068 @@ def upload_resume(modal: WebElement, resume: str) -> tuple[bool, str]:
 
 # Function to answer common questions for Easy Apply
 def answer_common_questions(label: str, answer: str) -> str:
-
-    if 'sponsorship' in label or 'visa' in label: answer = require_visa
     return answer
 
 
+def _normalized_form_text(value: str) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "").casefold())
+    text = "".join(character for character in text if not unicodedata.combining(character))
+    text = text.replace(".", "")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
+
+
+def _is_resume_attachment_question(question_text: str) -> bool:
+    question = _normalized_form_text(question_text)
+    has_resume_term = re.search(
+        r"\b(?:cv|resume|curriculum)\b", question
+    ) is not None
+    has_attachment_intent = any(
+        phrase in question
+        for phrase in (
+            "attach",
+            "attached",
+            "provide",
+            "adjunta",
+            "adjuntado",
+            "adjunto",
+            "proporciona",
+        )
+    )
+    return has_resume_term and has_attachment_intent
+
+
+def _localized_positive_option(options: list[str]) -> str | None:
+    for option in options:
+        if _normalized_form_text(option) in {"yes", "si"}:
+            return option
+    return None
+
+
+def _resume_selected_in_modal(modal: WebElement) -> bool:
+    """Use only current-modal UI state; never infer from configured files."""
+    selected_card_xpath = (
+        './/*['
+        '(contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"resume") '
+        'or contains(translate(@data-test,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"resume") '
+        'or contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"document-upload")) '
+        'and (contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"selected") '
+        'or @aria-selected="true" or @data-selected="true" '
+        'or @data-test-document-uploaded="true")]'
+    )
+    try:
+        for card in modal.find_elements(By.XPATH, selected_card_xpath):
+            try:
+                if not hasattr(card, "is_displayed") or card.is_displayed():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    resume_radio_xpath = (
+        './/input[@type="radio" and ancestor::*['
+        'contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"resume") '
+        'or contains(translate(@data-test,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"resume") '
+        'or contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"document-upload")]]'
+    )
+    try:
+        if any(radio.is_selected() for radio in modal.find_elements(By.XPATH, resume_radio_xpath)):
+            return True
+    except Exception:
+        pass
+
+    uploaded_resume_xpath = (
+        './/*['
+        '(contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"resume") '
+        'or contains(translate(@data-test,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"resume")) '
+        'and (contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"uploaded") '
+        'or @data-test-document-uploaded="true")]'
+    )
+    try:
+        for uploaded in modal.find_elements(By.XPATH, uploaded_resume_xpath):
+            try:
+                if not hasattr(uploaded, "is_displayed") or uploaded.is_displayed():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    file_input_xpath = (
+        './/input[@type="file" and ('
+        'contains(translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"resume") '
+        'or contains(translate(@id,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"resume") '
+        'or contains(translate(@aria-label,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"resume") '
+        'or contains(translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"cv") '
+        'or contains(translate(@id,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"cv"))]'
+    )
+    try:
+        return any(
+            bool(str(file_input.get_attribute("value") or "").strip())
+            for file_input in modal.find_elements(By.XPATH, file_input_xpath)
+        )
+    except Exception:
+        return False
+
+
+def _is_required(question: WebElement, control: WebElement) -> bool:
+    return any(
+        str(element.get_attribute(attribute) or "").lower() in {"true", "required"}
+        for element in (question, control) for attribute in ("required", "aria-required")
+    )
+
+
+def _validation_details(control: WebElement) -> tuple[str, dict]:
+    try:
+        message = str(control.get_property("validationMessage") or "").strip()
+    except Exception:
+        message = ""
+    try:
+        validity = control.get_property("validity") or {}
+        if not isinstance(validity, dict):
+            validity = {}
+    except Exception:
+        validity = {}
+    return message, validity
+
+
+def _field_constraints(control: WebElement) -> dict[str, str]:
+    constraints = {}
+    for name in (
+        "type",
+        "inputmode",
+        "min",
+        "max",
+        "step",
+        "required",
+        "aria-required",
+    ):
+        try:
+            value = control.get_attribute(name)
+        except Exception:
+            value = None
+        if value not in (None, ""):
+            constraints[name] = str(value)[:40]
+    return constraints
+
+
+def _numeric_intent_from_question(question_text: str) -> bool:
+    text = re.sub(r"\s+", " ", str(question_text or "").casefold())
+    scale_range = re.search(
+        r"(?:\(|\b)1\s*(?:-|–|—|to|a)\s*5(?:\)|\b)", text
+    )
+    scale_words = any(
+        phrase in text
+        for phrase in (
+            "on a scale of",
+            "en una escala de",
+            "numeric rating",
+            "numeric level",
+            "rating numérica",
+            "rating numerica",
+            "nivel numérico",
+            "nivel numerico",
+        )
+    )
+    return bool(scale_range or scale_words)
+
+
+def _is_numeric_control(control: WebElement, question_text: str = "") -> bool:
+    input_type = str(control.get_attribute("type") or "").casefold()
+    input_mode = str(control.get_attribute("inputmode") or "").casefold()
+    has_numeric_constraint = any(
+        control.get_attribute(attribute) not in (None, "")
+        for attribute in ("min", "max", "step")
+    )
+    message, validity = _validation_details(control)
+    numeric_validation = any(
+        marker in message.casefold()
+        for marker in (
+            "number",
+            "decimal",
+            "larger than",
+            "greater than",
+            "número",
+            "numero",
+            "numérico",
+            "numerico",
+        )
+    ) or any(
+        bool(validity.get(flag))
+        for flag in (
+            "badInput",
+            "typeMismatch",
+            "rangeUnderflow",
+            "rangeOverflow",
+            "stepMismatch",
+        )
+    )
+    return (
+        input_type == "number"
+        or input_mode in {"numeric", "decimal"}
+        or has_numeric_constraint
+        or _numeric_intent_from_question(question_text)
+        or numeric_validation
+    )
+
+
+def _validation_category(control: WebElement) -> str:
+    message, validity = _validation_details(control)
+    if any(bool(validity.get(flag)) for flag in ("badInput", "typeMismatch")):
+        return "numeric_type_mismatch"
+    if any(bool(validity.get(flag)) for flag in ("rangeUnderflow", "rangeOverflow", "stepMismatch")):
+        return "numeric_range_invalid"
+    normalized = message.casefold()
+    if any(marker in normalized for marker in ("number", "decimal", "número", "numero")):
+        return "numeric_validation_message"
+    if str(control.get_attribute("aria-invalid") or "").casefold() == "true":
+        return "aria_invalid"
+    return "required_value_missing" if not str(control.get_attribute("value") or "").strip() else "browser_invalid"
+
+
+def _plain_decimal(value) -> Decimal | None:
+    match = re.search(r"[-+]?\d[\d\s.,]*", str(value or ""))
+    if match is None:
+        return None
+    token = re.sub(r"\s+", "", match.group(0))
+    if "," in token and "." in token:
+        if token.rfind(",") > token.rfind("."):
+            token = token.replace(".", "").replace(",", ".")
+        else:
+            token = token.replace(",", "")
+    elif "," in token or "." in token:
+        separator = "," if "," in token else "."
+        whole, decimal = token.rsplit(separator, 1)
+        token = whole + decimal if len(decimal) == 3 else whole + "." + decimal
+    try:
+        return Decimal(token)
+    except InvalidOperation:
+        return None
+
+
+def _normalize_numeric_input(value, control: WebElement) -> str | None:
+    number = _plain_decimal(value)
+    if number is None:
+        return None
+    try:
+        minimum = _plain_decimal(control.get_attribute("min"))
+        maximum = _plain_decimal(control.get_attribute("max"))
+        step_value = str(control.get_attribute("step") or "").strip().casefold()
+        step = None if step_value in {"", "any"} else _plain_decimal(step_value)
+    except Exception:
+        return None
+    if minimum is not None and number < minimum:
+        return None
+    if maximum is not None and number > maximum:
+        return None
+    if step is not None:
+        if step <= 0:
+            return None
+        base = minimum or Decimal("0")
+        if (number - base) % step != 0:
+            return None
+    normalized = format(number, "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized or "0"
+
+
+def _browser_numeric_value_is_valid(control: WebElement) -> bool:
+    if str(control.get_attribute("aria-invalid") or "").casefold() == "true":
+        return False
+    try:
+        if str(control.get_property("validationMessage") or "").strip():
+            return False
+    except Exception:
+        pass
+    try:
+        return bool(driver.execute_script(
+            "return !arguments[0].checkValidity || arguments[0].checkValidity();",
+            control,
+        ))
+    except Exception:
+        return True
+
+
+def _fill_numeric_control(control: WebElement, value) -> tuple[bool, str]:
+    normalized = _normalize_numeric_input(value, control)
+    if normalized is None:
+        return False, ""
+    control.clear()
+    control.send_keys(normalized)
+    if _browser_numeric_value_is_valid(control):
+        return True, normalized
+    retry_value = _normalize_numeric_input(
+        control.get_attribute("value") or normalized,
+        control,
+    )
+    if retry_value is None:
+        return False, normalized
+    control.clear()
+    control.send_keys(retry_value)
+    return _browser_numeric_value_is_valid(control), retry_value
+
+
+def _unknown_answer(label, field_type, options, question, control, job_title, job_description, text_limit, unresolved_required):
+    required = _is_required(question, control)
+    key = f"{field_type}:{hash(label)}"
+    result = None
+    if any(word in label.lower() for word in ("first name", "middle name", "last name", "full name", "email", "phone")):
+        answer, reason = None, "contact_field_blocked"
+    else:
+        result = answer_unknown_question(
+            label,
+            field_type,
+            options,
+            job_title,
+            job_description or "",
+            text_limit,
+            required=required,
+            constraints=_field_constraints(control),
+        )
+        answer, reason = (result.answer if result.can_answer else None), result.reason_code
+    original_model_answer = str(answer or "").strip()
+    numeric_original_answer = ""
+    if answer is not None and _is_numeric_control(control, label):
+        normalized_answer = _normalize_numeric_input(answer, control)
+        if normalized_answer is None:
+            answer, reason = None, "numeric_input_invalid"
+        elif normalized_answer != str(answer).strip():
+            numeric_original_answer = str(answer).strip()
+            answer, reason = normalized_answer, "numeric_input_normalized"
+    if required and answer is None: unresolved_required.add(key)
+    elif answer is not None: unresolved_required.discard(key)
+    try:
+        control._ai_answer_metadata = {
+            "provider_request_count": int(
+                getattr(result, "provider_request_count", 0) or 0
+            ),
+            "original_answer": original_model_answer,
+            "reason_code": reason,
+        }
+    except Exception:
+        pass
+    queue = globals().get("ai_answer_review_queue")
+    if queue is not None:
+        try:
+            context = globals().get("ai_review_context", {})
+            provider_request_count = int(
+                getattr(result, "provider_request_count", 0) or 0
+            )
+            validation_failed = reason in {
+                "empty_answer",
+                "invalid_confidence",
+                "invalid_number",
+                "invalid_option",
+                "malformed_model_output",
+                "multilingual_language_mapping_failed",
+                "numeric_input_invalid",
+            }
+            validation_result = (
+                "valid"
+                if answer is not None
+                else "validation_failed"
+                if validation_failed
+                else "unresolved_required"
+                if required
+                else "validation_failed"
+            )
+            application_outcome = (
+                "answer_filled"
+                if answer is not None
+                else "unresolved_required"
+                if required
+                else "validation_failed"
+            )
+            policy_review_required = reason in {
+                "assertive_experience_yes_default",
+                "assertive_experience_threshold_yes_default",
+                "analyst_role_years_minimum_floor",
+                "experience_years_minimum_floor",
+                "localized_language_exact_fact",
+                "language_level_numeric_scale",
+                "multilingual_language_numeric_scale",
+                "multilingual_language_provider_mapping",
+                "numeric_input_normalized",
+                "salary_range_accepted_from_expected_salary",
+            }
+            original_answer = str(
+                numeric_original_answer
+                or getattr(result, "original_answer", "")
+                or ""
+            ).strip()
+            target_language = str(
+                getattr(result, "target_language", "") or ""
+            ).strip()
+            citizenship_exact_fact = (
+                reason == "exact_profile_fact"
+                and is_citizenship_question(label)
+            )
+            if (
+                provider_request_count > 0
+                or policy_review_required
+                or citizenship_exact_fact
+            ):
+                queue.record_answer(
+                    job_id=context.get("job_id", ""),
+                    company=context.get("company", ""),
+                    job_title=context.get("job_title", job_title),
+                    question=label,
+                    field_type=field_type,
+                    required=required,
+                    visible_options=options,
+                    proposed_answer=answer,
+                    reason_code=reason,
+                    provider_request_count=provider_request_count,
+                    validation_result=validation_result,
+                    application_outcome=application_outcome,
+                    conflicts_with_verified_fact=bool(
+                        getattr(result, "conflicts_with_verified_fact", False)
+                    ),
+                    record_without_provider=(
+                        policy_review_required or citizenship_exact_fact
+                    ),
+                    force_high_priority=(
+                        reason == "experience_years_minimum_floor"
+                        and original_answer in {"", "0"}
+                    ),
+                    force_normal_priority=citizenship_exact_fact,
+                    reviewer_notes=(
+                        (
+                            f"original_language_fact={original_answer or '[blank]'}; "
+                            "scale_detected=1-5"
+                        )
+                        if reason == "language_level_numeric_scale"
+                        else (
+                            f"target_language={target_language or '[unknown]'}; "
+                            "resolution_path=multilingual_single_field"
+                        )
+                        if reason in {
+                            "multilingual_language_mapping_failed",
+                            "multilingual_language_numeric_scale",
+                            "multilingual_language_provider_mapping",
+                        }
+                        else getattr(result, "original_answer", "")
+                        if reason == "salary_range_accepted_from_expected_salary"
+                        else f"original_proposed_answer={original_answer or '[blank]'}"
+                        if reason in {
+                            "analyst_role_years_minimum_floor",
+                            "experience_years_minimum_floor",
+                            "numeric_input_normalized",
+                        }
+                        else ""
+                    ),
+                )
+            elif required and answer is None and reason != "contact_field_blocked":
+                _record_required_review_event(
+                    label,
+                    field_type,
+                    options,
+                    reason,
+                    validation_result,
+                    application_outcome,
+                )
+        except Exception:
+            print_lg("AI answer review queue logging failed; browser workflow continues.")
+    target_language = str(
+        getattr(result, "target_language", "") or ""
+    ).strip()
+    if reason in {
+        "multilingual_language_mapping_failed",
+        "multilingual_language_numeric_scale",
+        "multilingual_language_provider_mapping",
+    }:
+        print_lg(
+            "Gemini fallback "
+            f"field_type={field_type} language_question_detected=true "
+            f"target_language={target_language or 'unknown'} "
+            f"option_count={len(options)} path=provider "
+            f"reason_code={reason} validation_outcome="
+            f"{'valid' if answer is not None else 'unresolved'}"
+        )
+    else:
+        print_lg(f"Gemini fallback field_type={field_type} success={answer is not None} reason_code={reason}")
+    return answer
+
+
+def _answers_match(left, right) -> bool:
+    return " ".join(str(left or "").casefold().split()) == " ".join(
+        str(right or "").casefold().split()
+    )
+
+
+def _is_select_placeholder(value, control=None) -> bool:
+    if control is not None:
+        try:
+            select = Select(control)
+            selected = select.first_selected_option
+            selected_value = str(selected.get_attribute("value") or "").strip()
+            selected_class = _normalized_form_text(
+                selected.get_attribute("class") or ""
+            )
+            dom_placeholder = any(
+                str(selected.get_attribute(name) or "").casefold()
+                in {"true", "disabled", "placeholder"}
+                for name in (
+                    "disabled",
+                    "aria-disabled",
+                    "data-placeholder",
+                    "data-is-placeholder",
+                )
+            ) or "placeholder" in selected_class
+            if dom_placeholder or not selected_value:
+                return True
+        except Exception:
+            pass
+        try:
+            if _browser_control_is_invalid(control, value, True):
+                return True
+        except Exception:
+            pass
+    normalized = _normalized_form_text(value)
+    return any(
+        _answers_match(value, placeholder)
+        for placeholder in (
+            "Select an option",
+            "Selecciona una opción",
+            "Sélectionnez une option",
+            "Selectionnez une option",
+            "Wybierz opcję",
+        )
+    ) or (
+        "option" in normalized
+        and any(
+            marker in normalized
+            for marker in ("select", "choose", "seleccion", "selection", "wybierz")
+        )
+    )
+
+
+def _is_positive_answer(value) -> bool:
+    return " ".join(str(value or "").casefold().split()) in {
+        "yes",
+        "sí",
+        "si",
+        "oui",
+        "ja",
+    }
+
+
+def _is_negative_answer(value) -> bool:
+    return _answers_match(value, "No")
+
+
+def _record_answer_review_event(
+    question: str,
+    field_type: str,
+    visible_options: list[str],
+    original_answer: str,
+    repaired_answer: str,
+    reason_code: str,
+    validation_category: str,
+    provider_request_count: int = 0,
+    validation_result: str = "valid",
+    required: bool = True,
+    reviewer_notes_extra: str = "",
+) -> None:
+    queue = globals().get("ai_answer_review_queue")
+    if queue is None:
+        return
+    try:
+        context = globals().get("ai_review_context", {})
+        is_valid = validation_result in {"valid", "valid_after_repair"}
+        citizenship_exact_fact = (
+            reason_code == "exact_profile_fact"
+            and is_citizenship_question(question)
+        )
+        notes = (
+            f"original_answer={original_answer or '[blank]'}; "
+            f"validation_category={validation_category}"
+        )
+        if reviewer_notes_extra:
+            notes += f"; {reviewer_notes_extra}"
+        queue.record_answer(
+            job_id=context.get("job_id", ""),
+            company=context.get("company", ""),
+            job_title=context.get("job_title", ""),
+            question=question,
+            field_type=field_type,
+            required=required,
+            visible_options=visible_options,
+            proposed_answer=repaired_answer,
+            reason_code=reason_code,
+            provider_request_count=provider_request_count,
+            validation_result=validation_result,
+            application_outcome=(
+                "answer_filled" if is_valid else "validation_failed"
+            ),
+            record_without_provider=True,
+            force_high_priority=not is_valid,
+            force_normal_priority=citizenship_exact_fact and is_valid,
+            reviewer_notes=notes,
+        )
+    except Exception:
+        print_lg("AI answer review queue logging failed; browser workflow continues.")
+
+
+def _verified_preserved_answer(
+    label: str,
+    field_type: str,
+    options: list[str],
+    current_answer: str,
+    constraints: dict | None = None,
+):
+    result = answer_verified_question(
+        label, field_type, options, constraints
+    )
+    if result.can_answer:
+        return result if not _answers_match(current_answer, result.answer) else None
+    if result.reason_code in {
+        "exact_option_unavailable", "exact_option_not_available"
+    }:
+        return result
+    if (
+        _is_negative_answer(current_answer)
+        and is_experience_capability_question(label)
+    ):
+        result = answer_deterministic_question(label, field_type, options)
+        if result.can_answer and not _answers_match(current_answer, result.answer):
+            return result
+    return None
+
+
+def _preserved_override_reason(label: str, current_answer: str, result) -> str:
+    if (
+        getattr(result, "reason_code", "") == "exact_profile_fact"
+        and is_citizenship_question(label)
+    ):
+        return "exact_profile_fact"
+    if getattr(result, "reason_code", "") == "salary_range_accepted_from_expected_salary":
+        return "salary_range_accepted_from_expected_salary"
+    if getattr(result, "reason_code", "") == "analyst_role_years_minimum_floor":
+        return "analyst_role_years_minimum_floor"
+    if (
+        _is_negative_answer(current_answer)
+        and is_experience_capability_question(label)
+        and _is_positive_answer(getattr(result, "answer", ""))
+    ):
+        return "stale_preserved_experience_overridden"
+    return "stale_preserved_value_overridden"
+
+
+def _record_review_outcome(application_outcome: str, reason_code: str = "") -> None:
+    queue = globals().get("ai_answer_review_queue")
+    if queue is None:
+        return
+    try:
+        context = globals().get("ai_review_context", {})
+        queue.record_outcome(
+            application_outcome,
+            job_id=context.get("job_id", ""),
+            company=context.get("company", ""),
+            job_title=context.get("job_title", ""),
+            reason_code=reason_code,
+        )
+    except Exception:
+        print_lg("AI answer review queue logging failed; browser workflow continues.")
+
+
+def _record_required_review_event(
+    question: str,
+    field_type: str,
+    visible_options: list[str],
+    reason_code: str,
+    validation_result: str = "unresolved_required",
+    application_outcome: str = "unresolved_required",
+) -> None:
+    queue = globals().get("ai_answer_review_queue")
+    if queue is None:
+        return
+    try:
+        context = globals().get("ai_review_context", {})
+        queue.record_required_event(
+            job_id=context.get("job_id", ""),
+            company=context.get("company", ""),
+            job_title=context.get("job_title", ""),
+            question=question,
+            field_type=field_type,
+            visible_options=visible_options,
+            reason_code=reason_code,
+            validation_result=validation_result,
+            application_outcome=application_outcome,
+        )
+    except Exception:
+        print_lg("AI answer review queue logging failed; browser workflow continues.")
+
+
+def _is_overall_experience_question(label: str) -> bool:
+    label = re.sub(r"[^\wáéíóúüñ]+", " ", label.casefold()).strip()
+    patterns = (
+        r"(?:how many )?(?:total |overall )?years of (?:professional |work )?experience(?: do you have)?",
+        r"(?:total|overall) (?:professional|work) experience",
+        r"total years working professionally",
+        r"(?:cuántos )?años (?:totales )?de experiencia(?: profesional)?(?: tienes)?",
+        r"experiencia profesional total",
+    )
+    return any(re.fullmatch(pattern, label) for pattern in patterns)
+
+
+def _browser_control_is_invalid(
+    control: WebElement,
+    current_value,
+    required: bool,
+) -> bool:
+    if str(control.get_attribute("aria-invalid") or "").casefold() == "true":
+        return True
+    message, validity = _validation_details(control)
+    if message or validity.get("valid") is False:
+        return True
+    if any(
+        bool(validity.get(flag))
+        for flag in (
+            "badInput",
+            "typeMismatch",
+            "rangeUnderflow",
+            "rangeOverflow",
+            "stepMismatch",
+            "valueMissing",
+        )
+    ):
+        return True
+    if required and not current_value:
+        return True
+    try:
+        return not bool(driver.execute_script(
+            "return !arguments[0].checkValidity || arguments[0].checkValidity();",
+            control,
+        ))
+    except Exception:
+        return False
+
+
+def _question_label(question: WebElement, container: WebElement | None = None) -> str:
+    target = container or question
+    label = try_xp(
+        target,
+        './/span[@data-test-form-builder-radio-button-form-component__title]',
+        False,
+    )
+    if not label:
+        label = try_xp(question, ".//label[@for]", False)
+    if not label:
+        try:
+            label = question.find_element(By.TAG_NAME, "label")
+            try:
+                label = label.find_element(By.TAG_NAME, "span")
+            except Exception:
+                pass
+        except Exception:
+            label = None
+    return str(getattr(label, "text", "") or "Unknown")
+
+
+def _collect_invalid_required_fields(modal: WebElement) -> list[dict]:
+    invalid_fields = []
+    for question in modal.find_elements(By.XPATH, ".//div[@data-test-form-element]"):
+        select_control = try_xp(question, ".//select", False)
+        if select_control:
+            select = Select(select_control)
+            options = [option.text for option in select.options]
+            current = select.first_selected_option.text
+            required = _is_required(question, select_control)
+            placeholder = _is_select_placeholder(current, select_control)
+            if required and (
+                placeholder
+                or _browser_control_is_invalid(select_control, current, required)
+            ):
+                invalid_fields.append({
+                    "question": question,
+                    "control": select_control,
+                    "kind": "select",
+                    "label": _question_label(question),
+                    "options": options,
+                    "current": current,
+                    "constraints": {
+                        name: select_control.get_attribute(name)
+                        for name in ("required", "aria-required")
+                    },
+                    "validation_category": _validation_category(select_control),
+                })
+            continue
+
+        radio = try_xp(
+            question,
+            './/fieldset[@data-test-form-builder-radio-button-form-component="true"]',
+            False,
+        )
+        if radio:
+            controls = radio.find_elements(By.TAG_NAME, "input")
+            options = []
+            current = ""
+            for control in controls:
+                option_id = control.get_attribute("id")
+                option_label = try_xp(
+                    radio, f'.//label[@for="{option_id}"]', False
+                )
+                option_text = str(getattr(option_label, "text", "") or "Unknown")
+                options.append(option_text)
+                if control.is_selected():
+                    current = option_text
+            required = _is_required(question, radio)
+            if required and _browser_control_is_invalid(radio, current, required):
+                invalid_fields.append({
+                    "question": question,
+                    "control": radio,
+                    "controls": controls,
+                    "kind": "radio",
+                    "label": _question_label(question, radio),
+                    "options": options,
+                    "current": current,
+                    "constraints": {
+                        name: radio.get_attribute(name)
+                        for name in ("required", "aria-required")
+                    },
+                    "validation_category": _validation_category(radio),
+                })
+            continue
+
+        control = try_xp(
+            question, ".//input[@type='text' or @type='number']", False
+        )
+        kind = "text"
+        if not control:
+            control = try_xp(question, ".//textarea", False)
+            kind = "textarea"
+        if control:
+            label = _question_label(question)
+            current = str(control.get_attribute("value") or "")
+            required = _is_required(question, control)
+            field_type = (
+                "number" if kind == "text" and _is_numeric_control(control, label)
+                else kind
+            )
+            if required and _browser_control_is_invalid(control, current, required):
+                invalid_fields.append({
+                    "question": question,
+                    "control": control,
+                    "kind": field_type,
+                    "label": label,
+                    "options": [],
+                    "current": current,
+                    "constraints": {
+                        name: control.get_attribute(name)
+                        for name in (
+                            "type",
+                            "inputmode",
+                            "min",
+                            "max",
+                            "step",
+                            "maxlength",
+                            "required",
+                            "aria-required",
+                        )
+                    },
+                    "validation_category": _validation_category(control),
+                })
+            continue
+
+        checkbox = try_xp(question, ".//input[@type='checkbox']", False)
+        if checkbox and _is_required(question, checkbox) and not checkbox.is_selected():
+            invalid_fields.append({
+                "question": question,
+                "control": checkbox,
+                "kind": "checkbox",
+                "label": _question_label(question),
+                "options": [],
+                "current": "",
+                "constraints": {"required": checkbox.get_attribute("required")},
+                "validation_category": "required_value_missing",
+            })
+    return invalid_fields
+
+
+def _fill_repair_field(field: dict, answer: str) -> bool:
+    control = field["control"]
+    kind = field["kind"]
+    if kind == "number":
+        valid, _submitted = _fill_numeric_control(control, answer)
+        return valid
+    for _attempt in range(2):
+        try:
+            if kind == "select":
+                Select(control).select_by_visible_text(answer)
+            elif kind == "radio":
+                index = field["options"].index(answer)
+                actions.move_to_element(field["controls"][index]).click().perform()
+            elif kind in {"text", "textarea"}:
+                control.clear()
+                control.send_keys(answer)
+            elif kind == "checkbox":
+                actions.move_to_element(control).click().perform()
+            else:
+                return False
+        except Exception:
+            continue
+        current = (
+            Select(control).first_selected_option.text
+            if kind == "select"
+            else answer
+        )
+        if not _browser_control_is_invalid(control, current, True):
+            return True
+    return False
+
+
+def repair_invalid_required_fields(
+    modal: WebElement,
+    work_location: str,
+    job_title: str,
+    job_description: str,
+    unresolved_required: set,
+    repaired_page_signatures: set,
+) -> bool:
+    """Repair each invalid required field once, with at most one pass per page."""
+    invalid_fields = _collect_invalid_required_fields(modal)
+    if not invalid_fields:
+        return not unresolved_required
+    signature = tuple(
+        sorted((field["kind"], field["label"]) for field in invalid_fields)
+    )
+    if signature in repaired_page_signatures:
+        return False
+    repaired_page_signatures.add(signature)
+    all_valid = True
+    for field in invalid_fields:
+        label = field["label"]
+        kind = field["kind"]
+        options = field["options"]
+        current = field["current"]
+        key = f"{kind}:{hash(label)}"
+        result = None
+        answer = None
+        reason = "deterministic_invalid_field_repair"
+        metadata = getattr(field["control"], "_ai_answer_metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        if _is_resume_attachment_question(label):
+            positive_option = _localized_positive_option(options)
+            if (
+                _resume_selected_in_modal(modal)
+                and positive_option is not None
+                and _fill_repair_field(field, positive_option)
+            ):
+                unresolved_required.discard(key)
+                _record_answer_review_event(
+                    label,
+                    kind,
+                    options,
+                    current,
+                    positive_option,
+                    "resume_attachment_confirmed",
+                    field["validation_category"],
+                    0,
+                    "valid",
+                )
+            else:
+                all_valid = False
+                unresolved_required.add(key)
+            continue
+
+        if kind == "checkbox":
+            answer = "checked"
+        elif kind == "number" and current:
+            answer = _normalize_numeric_input(current, field["control"])
+            if answer is not None and answer != current.strip():
+                reason = "numeric_input_normalized"
+        if not answer:
+            result = answer_deterministic_question(label, kind, options)
+            if result.can_answer:
+                answer = result.answer
+                if result.reason_code in {
+                    "analyst_role_years_minimum_floor",
+                    "language_level_numeric_scale",
+                    "localized_language_exact_fact",
+                }:
+                    reason = result.reason_code
+            elif result.reason_code not in {
+                "exact_option_unavailable", "exact_option_not_available"
+            }:
+                result = answer_unknown_question(
+                    label,
+                    kind,
+                    options,
+                    job_title,
+                    job_description or "",
+                    None,
+                    required=True,
+                    constraints=field["constraints"],
+                )
+                if result.can_answer:
+                    answer = result.answer
+                    reason = (
+                        result.reason_code
+                        if result.reason_code in {
+                            "multilingual_language_numeric_scale",
+                            "multilingual_language_provider_mapping",
+                        }
+                        else "provider_invalid_field_repair"
+                        if int(result.provider_request_count or 0) > 0
+                        else "deterministic_invalid_field_repair"
+                    )
+        provider_count = int(
+            getattr(result, "provider_request_count", 0)
+            or metadata.get("provider_request_count", 0)
+            or 0
+        )
+        valid = bool(answer) and _fill_repair_field(field, str(answer))
+        if valid:
+            unresolved_required.discard(key)
+            original = str(
+                getattr(result, "original_answer", "") or current or ""
+            )
+            _record_answer_review_event(
+                label,
+                kind,
+                options,
+                original,
+                str(answer),
+                reason,
+                field["validation_category"],
+                provider_count,
+                (
+                    "valid_after_repair"
+                    if reason == "numeric_input_normalized"
+                    else "valid"
+                ),
+                reviewer_notes_extra=(
+                    f"target_language={getattr(result, 'target_language', '') or '[unknown]'}"
+                    if reason in {
+                        "multilingual_language_numeric_scale",
+                        "multilingual_language_provider_mapping",
+                    }
+                    else ""
+                ),
+            )
+        else:
+            all_valid = False
+            unresolved_required.add(key)
+            _record_answer_review_event(
+                label,
+                kind,
+                options,
+                current,
+                str(answer or ""),
+                "invalid_field_repair_failed",
+                field["validation_category"],
+                provider_count,
+                "validation_failed",
+            )
+    return all_valid and not unresolved_required
+
+
 # Function to answer the questions for Easy Apply
-def answer_questions(modal: WebElement, questions_list: set, work_location: str, job_description: str | None = None ) -> set:
+def answer_questions(modal: WebElement, questions_list: set, work_location: str, job_title: str, unresolved_required: set, job_description: str | None = None ) -> set:
 
     # Get all questions from the page
      
@@ -665,9 +1734,11 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                 label_org = label.find_element(By.TAG_NAME, "span").text
             except: pass
             answer = 'Yes'
+            matched_rule = False
             label = label_org.lower()
 
-            select = Select(select)
+            select_element = select
+            select = Select(select_element)
             selected_option = select.first_selected_option.text
             optionsText = []
             options = '"List of phone country codes"'
@@ -676,27 +1747,120 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                 options = "".join([f' "{option}",' for option in optionsText])
             prev_answer = selected_option
 
-            if overwrite_previous_answers or selected_option in ["Select an option","Selecciona una opción"]:
-                if 'email' in label or 'phone' in label: answer = prev_answer
-                elif 'gender' in label or 'sex' in label: answer = gender
-                #yes/no exp
-                # elif 'experiencia' in label: answer = 'yes'
-                # elif 'Tienes' in label or 'tienes' in label or 'has' in label: answer = 'yes'
-                elif any(word in label.lower() for word in ['experiencia', 'tienes', 'has']):
-                    answer = "Sí" if "Sí" in optionsText else "Yes"  # Handle Spanish "Sí"
-                elif 'disability' in label: answer = disability_status
+            if _is_resume_attachment_question(label_org):
+                required = _is_required(Question, select_element)
+                positive_option = _localized_positive_option(optionsText)
+                resume_selected = _resume_selected_in_modal(modal)
+                if resume_selected and positive_option is not None:
+                    select.select_by_visible_text(positive_option)
+                    answer = positive_option
+                    unresolved_required.discard(f"select:{hash(label_org)}")
+                    _record_answer_review_event(
+                        label_org,
+                        "select",
+                        optionsText,
+                        selected_option,
+                        answer,
+                        "resume_attachment_confirmed",
+                        "selected_resume_ui_evidence",
+                        required=required,
+                    )
+                else:
+                    answer = None
+                    if required:
+                        unresolved_required.add(f"select:{hash(label_org)}")
+                        _record_required_review_event(
+                            label_org,
+                            "select",
+                            optionsText,
+                            (
+                                "resume_attachment_not_confirmed"
+                                if not resume_selected
+                                else "resume_attachment_positive_option_unavailable"
+                            ),
+                        )
+                questions_list.add((
+                    "select",
+                    "answered" if answer else "unresolved",
+                    "resume_attachment_confirmation",
+                ))
+                continue
+
+            placeholder_selected = _is_select_placeholder(
+                selected_option, select_element
+            )
+            if not overwrite_previous_answers and not placeholder_selected:
+                exact = _verified_preserved_answer(
+                    label_org,
+                    "select",
+                    optionsText,
+                    selected_option,
+                    _field_constraints(select_element),
+                )
+                if exact is not None and exact.can_answer:
+                    select.select_by_visible_text(exact.answer)
+                    answer = exact.answer
+                    _record_answer_review_event(
+                        label_org,
+                        "select",
+                        optionsText,
+                        selected_option,
+                        answer,
+                        _preserved_override_reason(
+                            label_org, selected_option, exact
+                        ),
+                        "verified_fact_conflict",
+                        required=_is_required(Question, select_element),
+                        reviewer_notes_extra=(
+                            getattr(exact, "original_answer", "")
+                            if getattr(exact, "reason_code", "")
+                            == "salary_range_accepted_from_expected_salary"
+                            else ""
+                        ),
+                    )
+                elif exact is not None:
+                    answer = None
+                    if _is_required(Question, select_element):
+                        unresolved_required.add(f"select:{hash(label_org)}")
+                        _record_required_review_event(
+                            label_org,
+                            "select",
+                            optionsText,
+                            getattr(
+                                exact,
+                                "reason_code",
+                                "exact_option_unavailable",
+                            ),
+                        )
+                else:
+                    answer = selected_option
+            else:
+                if 'email' in label or 'phone' in label: answer = prev_answer; matched_rule = True
+                elif 'gender' in label or 'sex' in label: answer = gender; matched_rule = True
+                elif 'disability' in label: answer = disability_status; matched_rule = True
+                elif any(language in label for language in (
+                    'english', 'inglés', 'ingles', 'anglais',
+                    'spanish', 'español', 'espanol', 'castellano', 'espagnol',
+                    'catalan', 'catalán', 'català', 'catala',
+                    'french', 'français', 'francais',
+                )):
+                    pass
                 elif 'proficiency' in label: answer = (
                     'Nativo o bilingüe' if 'Nativo o bilingüe' in optionsText
                     else ('Native or bilingual' if 'Native or bilingual' in optionsText 
                           else 'Professional')
-                )
+                ); matched_rule = True
                 #english level 
-                elif 'nivel' in label and 'ingl' in label: answer = 'Nativo o bilingüe' if 'Nativo o bilingüe' in optionsText else 'Native or bilingual'
-                else: answer = answer_common_questions(label,answer)
-                try: select.select_by_visible_text(answer)
-                except NoSuchElementException as e:
+                elif 'nivel' in label and 'ingl' in label: answer = 'Nativo o bilingüe' if 'Nativo o bilingüe' in optionsText else 'Native or bilingual'; matched_rule = True
+                foundOption = False
+                if matched_rule:
+                    try:
+                        select.select_by_visible_text(answer)
+                        foundOption = True
+                    except NoSuchElementException:
+                        pass
+                if matched_rule and not foundOption:
                     possible_answer_phrases = ["Decline", "not wish", "don't wish", "Prefer not", "not want"] if answer == 'Decline' else [answer]
-                    foundOption = False
                     for phrase in possible_answer_phrases:
                         for option in optionsText:
                             if phrase in option:
@@ -705,14 +1869,11 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                                 foundOption = True
                                 break
                         if foundOption: break
-                    if not foundOption:
-                        #TODO: Use AI to answer the question need to be implemented logic to extract the options for the question
-
-                        print_lg(f'Failed to find an option with text "{answer}" for question labelled "{label_org}", answering randomly!')
-                        select.select_by_index(randint(1, len(select.options)-1))
-                        answer = select.first_selected_option.text
-                        randomly_answered_questions.add((f'{label_org} [ {options} ]',"select"))
-            questions_list.add((f'{label_org} [ {options} ]', answer, "select", prev_answer))
+                if not foundOption:
+                    answer = _unknown_answer(label_org, "select", optionsText, Question, select_element, job_title, job_description, None, unresolved_required)
+                    if answer is not None: select.select_by_visible_text(answer)
+                    else: answer = prev_answer
+            questions_list.add(("select", "answered" if answer else "unresolved", "preserved" if prev_answer else "new"))
             continue
         
         # Check if it's a radio Question
@@ -724,40 +1885,126 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             except: pass
             label_org = label.text if label else "Unknown"
             answer = 'Yes'
+            matched_rule = False
             label = label_org.lower()
 
-            label_org += ' [ '
             options = radio.find_elements(By.TAG_NAME, 'input')
             options_labels = []
+            visible_options = []
             
             for option in options:
                 id = option.get_attribute("id")
                 option_label = try_xp(radio, f'.//label[@for="{id}"]', False)
+                visible_options.append(option_label.text if option_label else "Unknown")
                 options_labels.append( f'"{option_label.text if option_label else "Unknown"}"<{option.get_attribute("value")}>' ) # Saving option as "label <value>"
-                if option.is_selected(): prev_answer = options_labels[-1]
-                label_org += f' {options_labels[-1]},'
+                if option.is_selected(): prev_answer = visible_options[-1]
 
-            if overwrite_previous_answers or prev_answer is None:
-                if 'citizenship' in label or 'employment eligibility' or 'Work Permit' in label: answer = us_citizenship
-                elif 'veteran' in label or 'protected' in label: answer = veteran_status
+            if _is_resume_attachment_question(label_org):
+                required = _is_required(Question, radio)
+                positive_option = _localized_positive_option(visible_options)
+                resume_selected = _resume_selected_in_modal(modal)
+                if resume_selected and positive_option is not None:
+                    target = options[visible_options.index(positive_option)]
+                    actions.move_to_element(target).click().perform()
+                    answer = positive_option
+                    unresolved_required.discard(f"radio:{hash(label_org)}")
+                    _record_answer_review_event(
+                        label_org,
+                        "radio",
+                        visible_options,
+                        prev_answer or "",
+                        answer,
+                        "resume_attachment_confirmed",
+                        "selected_resume_ui_evidence",
+                        required=required,
+                    )
+                else:
+                    answer = None
+                    if required:
+                        unresolved_required.add(f"radio:{hash(label_org)}")
+                        _record_required_review_event(
+                            label_org,
+                            "radio",
+                            visible_options,
+                            (
+                                "resume_attachment_not_confirmed"
+                                if not resume_selected
+                                else "resume_attachment_positive_option_unavailable"
+                            ),
+                        )
+                questions_list.add((
+                    "radio",
+                    "answered" if answer else "unresolved",
+                    "resume_attachment_confirmation",
+                ))
+                continue
+
+            if not overwrite_previous_answers and prev_answer is not None:
+                exact = _verified_preserved_answer(
+                    label_org,
+                    "radio",
+                    visible_options,
+                    prev_answer,
+                    _field_constraints(radio),
+                )
+                if exact is not None and exact.can_answer:
+                    target = options[visible_options.index(exact.answer)]
+                    actions.move_to_element(target).click().perform()
+                    answer = exact.answer
+                    _record_answer_review_event(
+                        label_org,
+                        "radio",
+                        visible_options,
+                        prev_answer,
+                        answer,
+                        _preserved_override_reason(
+                            label_org, prev_answer, exact
+                        ),
+                        "verified_fact_conflict",
+                        required=_is_required(Question, radio),
+                        reviewer_notes_extra=(
+                            getattr(exact, "original_answer", "")
+                            if getattr(exact, "reason_code", "")
+                            == "salary_range_accepted_from_expected_salary"
+                            else ""
+                        ),
+                    )
+                elif exact is not None:
+                    answer = None
+                    if _is_required(Question, radio):
+                        unresolved_required.add(f"radio:{hash(label_org)}")
+                        _record_required_review_event(
+                            label_org,
+                            "radio",
+                            visible_options,
+                            getattr(
+                                exact,
+                                "reason_code",
+                                "exact_option_unavailable",
+                            ),
+                        )
+                else:
+                    answer = prev_answer
+            else:
+                if 'citizenship' in label: pass
+                elif 'veteran' in label or 'protected' in label: answer = veteran_status; matched_rule = True
                 elif 'disability' in label or 'handicapped' in label: 
-                    answer = disability_status
-                else: answer = answer_common_questions(label,answer)
-                foundOption = try_xp(radio, f".//label[normalize-space()='{answer}']", False)
-                if foundOption: 
+                    answer = disability_status; matched_rule = True
+                foundOption = try_xp(radio, f".//label[normalize-space()='{answer}']", False) if matched_rule else False
+                if foundOption:
                     actions.move_to_element(foundOption).click().perform()
-                else:    
+                else:
                     possible_answer_phrases = ["Decline", "not wish", "don't wish", "Prefer not", "not want"] if answer == 'Decline' else [answer]
-                    ele = options[0]
-                    answer = options_labels[0]
-                    for phrase in possible_answer_phrases:
-                        for i, option_label in enumerate(options_labels):
-                            if phrase in option_label:
-                                foundOption = options[i]
-                                ele = foundOption
-                                answer = f'Decline ({option_label})' if len(possible_answer_phrases) > 1 else option_label
-                                break
-                        if foundOption: break
+                    ele = None
+                    if matched_rule:
+                        for phrase in possible_answer_phrases:
+                            for i, option_label in enumerate(options_labels):
+                                if phrase in option_label:
+                                    foundOption = options[i]
+                                    ele = foundOption
+                                    answer = f'Decline ({option_label})' if len(possible_answer_phrases) > 1 else option_label
+                                    break
+                            if foundOption: break
                     # if answer == 'Decline':
                     #     answer = options_labels[0]
                     #     for phrase in ["Prefer not", "not want", "not wish"]:
@@ -766,14 +2013,15 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                     #             answer = f'Decline ({phrase})'
                     #             ele = foundOption
                     #             break
-                    actions.move_to_element(ele).click().perform()
-                    if not foundOption: randomly_answered_questions.add((f'{label_org} ]',"radio"))
-            else: answer = prev_answer
-            questions_list.add((label_org+" ]", answer, "radio", prev_answer))
+                    if ele is None:
+                        answer = _unknown_answer(label_org, "radio", visible_options, Question, radio, job_title, job_description, None, unresolved_required)
+                        if answer is not None: ele = options[visible_options.index(answer)]
+                    if ele is not None: actions.move_to_element(ele).click().perform()
+            questions_list.add(("radio", "answered" if answer else "unresolved", "preserved" if prev_answer else "new"))
             continue
         
         # Check if it's a text question
-        text = try_xp(Question, ".//input[@type='text']", False)
+        text = try_xp(Question, ".//input[@type='text' or @type='number']", False)
         if text: 
             do_actions = False
             label = try_xp(Question, ".//label[@for]", False)
@@ -782,10 +2030,42 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             label_org = label.text if label else "Unknown"
             answer = "" # years_of_experience
             label = label_org.lower()
+            field_type = "number" if (
+                _is_numeric_control(text, label_org)
+                or re.search(r"\b(how many|years?|cuántos|cuantos|años?)\b", label)
+            ) else "text"
 
             prev_answer = text.get_attribute("value")
-            if not prev_answer or overwrite_previous_answers:
-                if 'experience' in label or 'years' in label or 'experiencia' in label: answer = years_of_experience
+            preserved_answer = prev_answer
+            preserved_exact = None
+            exact_option_blocked = False
+            if prev_answer and not overwrite_previous_answers:
+                preserved_exact = _verified_preserved_answer(
+                    label_org,
+                    field_type,
+                    [],
+                    prev_answer,
+                    _field_constraints(text),
+                )
+                if preserved_exact is not None and preserved_exact.can_answer:
+                    answer = preserved_exact.answer
+                elif preserved_exact is not None:
+                    exact_option_blocked = True
+                    if _is_required(Question, text):
+                        unresolved_required.add(f"{field_type}:{hash(label_org)}")
+                        _record_required_review_event(
+                            label_org,
+                            field_type,
+                            [],
+                            getattr(
+                                preserved_exact,
+                                "reason_code",
+                                "exact_option_unavailable",
+                            ),
+                        )
+            if (not prev_answer or overwrite_previous_answers or answer) and not exact_option_blocked:
+                if answer: pass
+                elif _is_overall_experience_question(label): answer = years_of_experience
                 #yes/no exp
                 #############################################################
                 ##############################################################################
@@ -819,12 +2099,17 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                         else:
                             answer = current_ctc
                     else:
-                        if 'month' in label:
-                            answer = desired_salary_monthly
-                        elif 'lakh' in label:
-                            answer = desired_salary_lakhs
-                        else:
-                            answer = desired_salary
+                        answer = _unknown_answer(
+                            label_org,
+                            field_type,
+                            [],
+                            Question,
+                            text,
+                            job_title,
+                            job_description,
+                            None,
+                            unresolved_required,
+                        ) or ""
                 elif 'linkedin' in label: answer = linkedIn
                 elif 'website' in label or 'blog' in label or 'portfolio' in label or 'link' in label: answer = website
                 elif 'scale of 1-10' in label: answer = confidence_level
@@ -837,23 +2122,61 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                 ##> ------ Dheeraj Deshwal : dheeraj9811 Email:dheeraj20194@iiitd.ac.in/dheerajdeshwal9811@gmail.com - Feature ------
 
                 if answer == "":
-                    if use_AI and aiClient:
-                        try:
-                             answer = ai_answer_question(aiClient, label_org, question_type="text" ,job_description=job_description, user_information_all = user_information_all)
-                             print_lg(f'AI Answered recived for question"{label_org}" \nhere is answer : "{answer}"')
-                        except Exception as e:
-                            print_lg("Failed to get AI answer!", e)
-                    else:
-                        randomly_answered_questions.add((label_org, "text"))
-                        answer = years_of_experience
+                    try: text_limit = int(text.get_attribute("maxlength") or 0) or None
+                    except (TypeError, ValueError): text_limit = None
+                    answer = _unknown_answer(label_org, field_type, [], Question, text, job_title, job_description, text_limit, unresolved_required) or ""
                  ##< 
-                text.clear()
-                text.send_keys(answer)
+                if answer:
+                    if _is_numeric_control(text, label_org):
+                        valid_numeric, submitted_numeric = _fill_numeric_control(
+                            text, answer
+                        )
+                        if valid_numeric:
+                            answer = submitted_numeric
+                            unresolved_required.discard(
+                                f"{field_type}:{hash(label_org)}"
+                            )
+                        else:
+                            answer = ""
+                            if _is_required(Question, text):
+                                unresolved_required.add(
+                                    f"{field_type}:{hash(label_org)}"
+                                )
+                                _record_required_review_event(
+                                    label_org,
+                                    field_type,
+                                    [],
+                                    "numeric_browser_validation_failed",
+                                    "validation_failed",
+                                    "validation_failed",
+                                )
+                    else:
+                        text.clear()
+                        text.send_keys(answer)
+                    if answer and preserved_exact is not None and preserved_exact.can_answer:
+                        _record_answer_review_event(
+                            label_org,
+                            field_type,
+                            [],
+                            preserved_answer,
+                            answer,
+                            _preserved_override_reason(
+                                label_org, preserved_answer, preserved_exact
+                            ),
+                            "verified_fact_conflict",
+                            required=_is_required(Question, text),
+                            reviewer_notes_extra=(
+                                getattr(preserved_exact, "original_answer", "")
+                                if getattr(preserved_exact, "reason_code", "")
+                                == "salary_range_accepted_from_expected_salary"
+                                else ""
+                            ),
+                        )
                 if do_actions:
                     sleep(2)
                     actions.send_keys(Keys.ARROW_DOWN)
                     actions.send_keys(Keys.ENTER).perform()
-            questions_list.add((label, text.get_attribute("value"), "text", prev_answer))
+            questions_list.add((field_type, "answered" if text.get_attribute("value") else "unresolved", "preserved" if preserved_answer else "new"))
             continue
 
         # Check if it's a textarea question
@@ -868,22 +2191,13 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                 if 'summary' in label: answer = linkedin_summary
                 elif 'cover' in label: answer = cover_letter
                 if answer == "":
-                ##> ------ Dheeraj Deshwal : dheeraj9811 Email:dheeraj20194@iiitd.ac.in/dheerajdeshwal9811@gmail.com - Feature ------
-                    if use_AI and aiClient:
-                        try:
-                             answer = ai_answer_question(aiClient, label_org, question_type="textarea" ,job_description=job_description, user_information_all = user_information_all)
-                             print_lg(f'AI Answered recived for question"{label_org}" \nhere is answer : "{answer}"')
-                        except Exception as e:
-                            print_lg("Failed to get AI answer!", e)
-                    else:
-                        randomly_answered_questions.add((label_org, "textarea"))
-            text_area.clear()
-            text_area.send_keys(answer)
-            if do_actions:
-                    sleep(2)
-                    actions.send_keys(Keys.ARROW_DOWN)
-                    actions.send_keys(Keys.ENTER).perform()
-            questions_list.add((label, text_area.get_attribute("value"), "textarea", prev_answer))
+                    try: text_limit = int(text_area.get_attribute("maxlength") or 0) or None
+                    except (TypeError, ValueError): text_limit = None
+                    answer = _unknown_answer(label_org, "textarea", [], Question, text_area, job_title, job_description, text_limit, unresolved_required) or ""
+            if answer:
+                text_area.clear()
+                text_area.send_keys(answer)
+            questions_list.add(("textarea", "answered" if text_area.get_attribute("value") else "unresolved", "preserved" if prev_answer else "new"))
             ##<
             continue
 
@@ -897,14 +2211,22 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             answer = answer.text if answer else "Unknown"
             prev_answer = checkbox.is_selected()
             checked = prev_answer
-            if not prev_answer:
+            if not prev_answer and _is_required(Question, checkbox):
                 try:
                     actions.move_to_element(checkbox).click().perform()
                     checked = True
                 except Exception as e: 
                     print_lg("Checkbox click failed!", e)
+                    _record_required_review_event(
+                        label_org,
+                        "checkbox",
+                        [answer],
+                        "checkbox_click_failed",
+                        "validation_failed",
+                        "validation_failed",
+                    )
                     pass
-            questions_list.add((f'{label} ([X] {answer})', checked, "checkbox", prev_answer))
+            questions_list.add(("checkbox", "answered" if checked else "optional_unchecked", "preserved" if prev_answer else "new"))
             continue
 
 
@@ -1021,10 +2343,757 @@ def submitted_jobs(job_id: str, title: str, company: str, work_location: str, wo
 
 
 
-# Function to discard the job application
-def discard_job() -> None:
-    actions.send_keys(Keys.ESCAPE).perform()
-    wait_span_click(driver, 'Discard', 2)
+def _element_is_visible(element) -> bool:
+    try:
+        return not hasattr(element, "is_displayed") or element.is_displayed()
+    except Exception:
+        return False
+
+
+def _element_is_enabled(element) -> bool:
+    try:
+        return not hasattr(element, "is_enabled") or element.is_enabled()
+    except Exception:
+        return False
+
+
+def _visible_easy_apply_modals(browser) -> list:
+    try:
+        modals = browser.find_elements(
+            By.XPATH,
+            '//div['
+            'contains(concat(" ",normalize-space(@class)," ")," jobs-easy-apply-modal ") '
+            'or @data-test-modal-id="easy-apply-modal"]',
+        )
+    except Exception:
+        return []
+    return [modal for modal in modals if _element_is_visible(modal)]
+
+
+def _control_text(control) -> str:
+    values = []
+    try:
+        values.append(str(control.text or ""))
+    except Exception:
+        pass
+    for attribute in ("aria-label", "title", "data-control-name"):
+        try:
+            values.append(str(control.get_attribute(attribute) or ""))
+        except Exception:
+            continue
+    return _normalized_form_text(" ".join(values))
+
+
+def _localized_modal_action(control, action: str) -> bool:
+    words = set(_control_text(control).split())
+    if action == "close":
+        return bool(words.intersection({
+            "close", "dismiss", "cerrar", "fermer", "zamknij", "fechar",
+            "schliessen", "chiudi", "sluiten",
+        }))
+    if action == "discard":
+        return bool(words.intersection({
+            "discard", "descartar", "abandon", "abandonner", "abandonar",
+            "odrzuc", "verwerfen", "annulla",
+        }))
+    if action == "save":
+        return bool(words.intersection({
+            "save", "guardar", "enregistrer", "zapisz", "speichern",
+            "salva", "bewaren",
+        }))
+    if action == "done":
+        return bool(words.intersection({
+            "done", "hecho", "termine", "gotowe", "fertig", "fatto",
+        }))
+    return False
+
+
+def _scoped_action_buttons(scope, action: str) -> list:
+    candidates = []
+    xpaths = (
+        './/button[contains(@class,"artdeco-modal__dismiss")]',
+        ".//button",
+    ) if action == "close" else (".//button",)
+    for xpath in xpaths:
+        try:
+            for button in scope.find_elements(By.XPATH, xpath):
+                if button not in candidates:
+                    candidates.append(button)
+        except Exception:
+            continue
+    return [
+        button for button in candidates
+        if _element_is_visible(button)
+        and _element_is_enabled(button)
+        and _localized_modal_action(button, action)
+    ]
+
+
+def _visible_modal_dialogs(browser) -> list:
+    dialogs = []
+    for xpath in (
+        '//*[@role="dialog" or @role="alertdialog"]',
+        '//*[contains(concat(" ",normalize-space(@class)," "),'
+        '" artdeco-modal ")]',
+        '//*[@data-test-modal-container]',
+        '//*[contains(concat(" ",normalize-space(@class)," "),'
+        '" artdeco-modal-overlay ")]',
+    ):
+        try:
+            for dialog in browser.find_elements(By.XPATH, xpath):
+                if dialog not in dialogs:
+                    dialogs.append(dialog)
+        except Exception:
+            continue
+    return [dialog for dialog in dialogs if _element_is_visible(dialog)]
+
+
+def _visible_top_level_overlays(browser) -> list:
+    overlays = _visible_modal_dialogs(browser)
+    for modal in _visible_easy_apply_modals(browser):
+        if modal not in overlays:
+            overlays.append(modal)
+    return overlays
+
+
+def _abandonment_confirmation_text(dialog) -> bool:
+    try:
+        text = _normalized_form_text(dialog.text)
+    except Exception:
+        return False
+    return any(phrase in text for phrase in (
+        "save this application",
+        "save your application",
+        "save application for later",
+        "return to this application later",
+        "guardar esta solicitud",
+        "guardar tu solicitud",
+        "enregistrer cette candidature",
+        "zapisz te aplikacje",
+    ))
+
+
+def _visible_abandonment_dialogs(browser) -> list:
+    abandonment_dialogs = []
+    for dialog in _visible_modal_dialogs(browser):
+        discard_buttons = _scoped_action_buttons(dialog, "discard")
+        save_buttons = _scoped_action_buttons(dialog, "save")
+        if discard_buttons and (
+            save_buttons or _abandonment_confirmation_text(dialog)
+        ):
+            abandonment_dialogs.append(dialog)
+    return abandonment_dialogs
+
+
+def _visible_discard_dialogs(browser) -> list:
+    dialogs = _visible_abandonment_dialogs(browser)
+    for dialog in _visible_modal_dialogs(browser):
+        if dialog in dialogs:
+            continue
+        if (
+            bool(_scoped_action_buttons(dialog, "discard"))
+            or _localized_modal_action(dialog, "discard")
+        ):
+            dialogs.append(dialog)
+    return dialogs
+
+
+def _success_confirmation_text(modal) -> bool:
+    try:
+        text = _normalized_form_text(modal.text)
+    except Exception:
+        return False
+    return any(phrase in text for phrase in (
+        "your application was sent",
+        "application was sent",
+        "application submitted",
+        "application has been submitted",
+        "tu solicitud se ha enviado",
+        "solicitud enviada",
+        "votre candidature a ete envoyee",
+        "candidature envoyee",
+        "aplikacja zostala wyslana",
+    ))
+
+
+def _visible_success_modals(browser) -> list:
+    return [
+        modal for modal in _visible_top_level_overlays(browser)
+        if _success_confirmation_text(modal)
+    ]
+
+
+def _success_dismiss_buttons(modal) -> list:
+    try:
+        buttons = [
+            button for button in modal.find_elements(By.XPATH, ".//button")
+            if _element_is_visible(button) and _element_is_enabled(button)
+        ]
+    except Exception:
+        return []
+    done = [
+        button for button in buttons
+        if _localized_modal_action(button, "done")
+    ]
+    not_now = [
+        button for button in buttons
+        if _control_text(button) in {
+            "not now", "ahora no", "pas maintenant", "nie teraz"
+        }
+        and button not in done
+    ]
+    close = [
+        button for button in buttons
+        if _localized_modal_action(button, "close")
+        and button not in done
+        and button not in not_now
+    ]
+    return done + not_now + close
+
+
+def _wait_for_success_modal_absent(browser, tracked_modals=None) -> bool:
+    tracked_modals = list(
+        tracked_modals
+        if tracked_modals is not None
+        else _visible_success_modals(browser)
+    )
+    for _ in range(10):
+        visible_overlays = _visible_top_level_overlays(browser)
+        tracked_remain = any(
+            modal in visible_overlays and _element_is_visible(modal)
+            for modal in tracked_modals
+        )
+        if not tracked_remain and not _visible_success_modals(browser):
+            return True
+        sleep(0.2)
+    visible_overlays = _visible_top_level_overlays(browser)
+    tracked_remain = any(
+        modal in visible_overlays and _element_is_visible(modal)
+        for modal in tracked_modals
+    )
+    return not tracked_remain and not _visible_success_modals(browser)
+
+
+def _dismiss_confirmed_success_modal(browser) -> dict:
+    """Dismiss only an already-confirmed post-submit modal."""
+    success_modals = _visible_success_modals(browser)
+    if not success_modals:
+        return {
+            "confirmed": False,
+            "dismissed": False,
+            "modal_remains_open": False,
+            "action": "none",
+        }
+
+    # Prefer the visible modal's own Done, Not now, then close control. Update
+    # profile is never eligible.
+    for modal in _visible_success_modals(browser):
+        for button in _success_dismiss_buttons(modal):
+            try:
+                button.click()
+            except Exception:
+                continue
+            if _wait_for_success_modal_absent(browser, success_modals):
+                return {
+                    "confirmed": True,
+                    "dismissed": True,
+                    "modal_remains_open": False,
+                    "action": "modal_dismiss",
+                }
+
+    # Retain the historical Escape only as a final bounded fallback after the
+    # modal has already been classified as a confirmed success.
+    try:
+        actions.send_keys(Keys.ESCAPE).perform()
+    except Exception:
+        pass
+    if _wait_for_success_modal_absent(browser, success_modals):
+        return {
+            "confirmed": True,
+            "dismissed": True,
+            "modal_remains_open": False,
+            "action": "historical_escape",
+        }
+
+    visible_overlays = _visible_top_level_overlays(browser)
+    modal_remains_open = any(
+        modal in visible_overlays and _element_is_visible(modal)
+        for modal in success_modals
+    ) or bool(_visible_success_modals(browser))
+    return {
+        "confirmed": True,
+        "dismissed": not modal_remains_open,
+        "modal_remains_open": modal_remains_open,
+        "action": "cleanup_failed" if modal_remains_open else "modal_dismiss",
+    }
+
+
+def _cleanup_confirmed_success_modal(browser, job_id: str = "") -> dict | None:
+    dismissal = _dismiss_confirmed_success_modal(browser)
+    if not dismissal["confirmed"]:
+        return None
+    result = {
+        "success": dismissal["dismissed"],
+        "reason_code": (
+            "easy_apply_modal_closed"
+            if dismissal["dismissed"]
+            else "post_apply_success_modal_cleanup_failed"
+        ),
+        "modal_remains_open": dismissal["modal_remains_open"],
+        "cleanup_needed": True,
+        "close_used": dismissal["action"] in {
+            "historical_escape", "modal_dismiss"
+        },
+        "discard_used": False,
+        "attempt_count": 1,
+        "success_confirmation": True,
+    }
+    print_lg(
+        "Easy Apply cleanup "
+        f"job_id={job_id or 'unknown'} "
+        f"cleanup_result={'success' if result['success'] else 'failure'} "
+        f"reason_code={result['reason_code']} "
+        f"modal_remains_open={str(result['modal_remains_open']).lower()}"
+    )
+    return result
+
+
+def _post_submit_validation_detected(
+    form_modal,
+    unresolved_required: set,
+) -> bool:
+    if unresolved_required:
+        return True
+    if form_modal is None or not _element_is_visible(form_modal):
+        return False
+    if _collect_invalid_required_fields(form_modal):
+        return True
+    try:
+        errors = form_modal.find_elements(
+            By.XPATH,
+            './/*[@aria-invalid="true" or '
+            'contains(@class,"artdeco-inline-feedback--error") or '
+            'contains(@class,"fb-form-element__error-text")]',
+        )
+    except Exception:
+        return False
+    return any(_element_is_visible(error) for error in errors)
+
+
+def _job_applied_state_detected(job, browser) -> bool:
+    applied_labels = {
+        "applied", "solicitud enviada", "candidature envoyee", "aplicado",
+    }
+    if job is not None:
+        try:
+            states = job.find_elements(
+                By.XPATH,
+                './/*[contains(@class,"job-card-container__footer-job-state")]',
+            )
+        except Exception:
+            states = []
+        for state in states:
+            try:
+                if (
+                    _element_is_visible(state)
+                    and _normalized_form_text(state.text) in applied_labels
+                ):
+                    return True
+            except Exception:
+                continue
+        try:
+            job_text = _normalized_form_text(job.text)
+            if any(
+                re.search(rf"(?<!\w){re.escape(label)}(?!\w)", job_text)
+                for label in applied_labels
+            ):
+                return True
+        except Exception:
+            pass
+    try:
+        details_states = browser.find_elements(
+            By.XPATH,
+            '//*[contains(@class,"jobs-s-apply__application-link")]',
+        )
+    except Exception:
+        details_states = []
+    for state in details_states:
+        try:
+            if _element_is_visible(state):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _post_submit_snapshot(
+    browser,
+    form_modal,
+    job,
+    unresolved_required: set,
+) -> dict:
+    success_modals = _visible_success_modals(browser)
+    overlays = _visible_top_level_overlays(browser)
+    applied_state = _job_applied_state_detected(job, browser)
+    if success_modals:
+        status = "success"
+    elif _post_submit_validation_detected(form_modal, unresolved_required):
+        status = "validation_error"
+    elif _find_job_search_safety_reminder(browser) is not None:
+        status = "safety_warning"
+    elif applied_state and not overlays:
+        status = "success"
+    else:
+        status = "pending"
+    return {
+        "status": status,
+        "success_modal_detected": bool(success_modals),
+        "applied_state_detected": applied_state,
+        "visible_overlay_count": len(overlays),
+        "modal_remains_open": bool(overlays),
+    }
+
+
+def _wait_for_post_submit_state(
+    browser,
+    form_modal,
+    job,
+    unresolved_required: set,
+    timeout_seconds: float = 12.0,
+    poll_seconds: float = 0.25,
+) -> dict:
+    attempts = max(1, int(timeout_seconds / max(poll_seconds, 0.1)))
+    snapshot = None
+    for _ in range(attempts):
+        snapshot = _post_submit_snapshot(
+            browser, form_modal, job, unresolved_required
+        )
+        if snapshot["status"] != "pending":
+            return snapshot
+        sleep(poll_seconds)
+    snapshot = snapshot or {
+        "success_modal_detected": False,
+        "applied_state_detected": False,
+        "visible_overlay_count": 0,
+        "modal_remains_open": False,
+    }
+    snapshot["status"] = "timeout"
+    return snapshot
+
+
+def _log_post_submit_state(
+    job_id: str,
+    state: dict,
+    *,
+    success_accounted: bool,
+    cleanup_result: str,
+    modal_remains_open: bool | None = None,
+) -> None:
+    remains_open = (
+        state.get("modal_remains_open", False)
+        if modal_remains_open is None
+        else modal_remains_open
+    )
+    print_lg(
+        "Post-submit wait "
+        f"job_id={job_id or 'unknown'} submit_clicked=true "
+        f"success_modal_detected={str(bool(state.get('success_modal_detected'))).lower()} "
+        f"applied_state_detected={str(bool(state.get('applied_state_detected'))).lower()} "
+        f"visible_overlay_count={int(state.get('visible_overlay_count') or 0)} "
+        f"success_accounted={str(bool(success_accounted)).lower()} "
+        f"cleanup_result={cleanup_result} "
+        f"modal_remains_open={str(bool(remains_open)).lower()}"
+    )
+
+
+def _easy_apply_blocker_state(browser) -> tuple[list, list]:
+    return _visible_easy_apply_modals(browser), _visible_discard_dialogs(browser)
+
+
+def _cleanup_easy_apply_modal_once(browser) -> dict:
+    modals, discard_dialogs = _easy_apply_blocker_state(browser)
+    cleanup_needed = bool(modals or discard_dialogs)
+    close_used = False
+    discard_used = False
+
+    # An already-open confirmation dialog is the active modal layer. Otherwise,
+    # use only the Easy Apply modal's own dismiss control.
+    if not discard_dialogs:
+        for modal in modals:
+            close_buttons = _scoped_action_buttons(modal, "close")
+            if not close_buttons:
+                continue
+            try:
+                close_buttons[0].click()
+                close_used = True
+            except Exception:
+                continue
+
+    modal_remains_open = True
+    for _ in range(10):
+        # The save-draft confirmation can appear after the close click. Re-scan
+        # on every poll and click only its localized Discard action.
+        for dialog in _visible_discard_dialogs(browser):
+            discard_buttons = _scoped_action_buttons(dialog, "discard")
+            if not discard_buttons:
+                continue
+            try:
+                discard_buttons[0].click()
+                discard_used = True
+            except Exception:
+                continue
+        active_modals, active_discard_dialogs = _easy_apply_blocker_state(browser)
+        modal_remains_open = bool(active_modals or active_discard_dialogs)
+        if not modal_remains_open:
+            break
+        sleep(0.2)
+
+    success = not modal_remains_open
+    if not success:
+        reason_code = "easy_apply_modal_cleanup_failed"
+    elif discard_used:
+        reason_code = "easy_apply_application_discarded"
+    else:
+        reason_code = "easy_apply_modal_closed"
+    return {
+        "success": success,
+        "reason_code": reason_code,
+        "modal_remains_open": modal_remains_open,
+        "cleanup_needed": cleanup_needed,
+        "close_used": close_used,
+        "discard_used": discard_used,
+        "success_confirmation": False,
+    }
+
+
+def _cleanup_easy_apply_modal(browser, job_id: str = "") -> dict:
+    """Close only Easy Apply UI, retrying once and returning safe metadata."""
+    if _visible_success_modals(browser):
+        return {
+            "success": False,
+            "reason_code": "post_apply_success_modal_pending",
+            "modal_remains_open": True,
+            "cleanup_needed": True,
+            "close_used": False,
+            "discard_used": False,
+            "attempt_count": 0,
+            "success_confirmation": True,
+        }
+    aggregate_cleanup_needed = False
+    aggregate_close_used = False
+    aggregate_discard_used = False
+    result = None
+    for attempt_count in range(1, 3):
+        result = _cleanup_easy_apply_modal_once(browser)
+        aggregate_cleanup_needed = (
+            aggregate_cleanup_needed or result["cleanup_needed"]
+        )
+        aggregate_close_used = aggregate_close_used or result["close_used"]
+        aggregate_discard_used = aggregate_discard_used or result["discard_used"]
+        if result["success"]:
+            break
+
+    result["attempt_count"] = attempt_count
+    result["cleanup_needed"] = aggregate_cleanup_needed
+    result["close_used"] = aggregate_close_used
+    result["discard_used"] = aggregate_discard_used
+    if result["success"]:
+        result["reason_code"] = (
+            "easy_apply_application_discarded"
+            if aggregate_discard_used
+            else "easy_apply_modal_closed"
+        )
+    if aggregate_cleanup_needed:
+        _record_review_outcome("application_discarded", result["reason_code"])
+        print_lg(
+            "Easy Apply cleanup "
+            f"job_id={job_id or 'unknown'} "
+            f"cleanup_result={'success' if result['success'] else 'failure'} "
+            f"reason_code={result['reason_code']} "
+            f"modal_remains_open={str(result['modal_remains_open']).lower()}"
+        )
+    return result
+
+
+def _classify_visible_overlays(browser) -> dict:
+    overlays = _visible_top_level_overlays(browser)
+    success = _visible_success_modals(browser)
+    safety_dialog = _find_job_search_safety_reminder(browser)
+    safety = [safety_dialog] if safety_dialog is not None else []
+    abandonment = _visible_abandonment_dialogs(browser)
+    unfinished = [
+        modal for modal in _visible_easy_apply_modals(browser)
+        if modal not in success
+    ]
+    classified = success + safety + abandonment + unfinished
+    unknown = [overlay for overlay in overlays if overlay not in classified]
+    return {
+        "success": success,
+        "safety": safety,
+        "abandonment": abandonment,
+        "unfinished": unfinished,
+        "unknown": unknown,
+        "overlay_count": len(overlays),
+    }
+
+
+def _guard_next_job_click(browser, job_id: str = "") -> dict:
+    """Prevent job-card clicks while an Easy Apply layer is still active."""
+    classification = _classify_visible_overlays(browser)
+    if classification["success"]:
+        return _cleanup_confirmed_success_modal(browser, job_id)
+    if classification["safety"]:
+        _detected, safely_closed = _close_job_search_safety_reminder(browser)
+        if not safely_closed:
+            return {
+                "success": False,
+                "reason_code": "easy_apply_modal_cleanup_failed",
+                "modal_remains_open": True,
+                "cleanup_needed": True,
+                "close_used": False,
+                "discard_used": False,
+                "attempt_count": 1,
+                "success_confirmation": False,
+            }
+        sleep(0.2)
+        classification = _classify_visible_overlays(browser)
+        if classification["success"]:
+            return _cleanup_confirmed_success_modal(browser, job_id)
+    if classification["abandonment"] or classification["unfinished"]:
+        return _cleanup_easy_apply_modal(browser, job_id)
+    if classification["unknown"]:
+        result = {
+            "success": False,
+            "reason_code": "easy_apply_modal_cleanup_failed",
+            "modal_remains_open": True,
+            "cleanup_needed": True,
+            "close_used": False,
+            "discard_used": False,
+            "attempt_count": 0,
+            "success_confirmation": False,
+        }
+        print_lg(
+            "Easy Apply cleanup "
+            f"job_id={job_id or 'unknown'} cleanup_result=failure "
+            "reason_code=easy_apply_modal_cleanup_failed "
+            "modal_remains_open=true"
+        )
+        return result
+    if not any(classification.values()):
+        # Kept for defensive compatibility with non-dict test doubles.
+        classification = {"overlay_count": 0}
+    if not classification.get("overlay_count"):
+        return {
+            "success": True,
+            "reason_code": "easy_apply_modal_closed",
+            "modal_remains_open": False,
+            "cleanup_needed": False,
+            "close_used": False,
+            "discard_used": False,
+            "attempt_count": 0,
+            "success_confirmation": False,
+        }
+    return {
+        "success": False,
+        "reason_code": "easy_apply_modal_cleanup_failed",
+        "modal_remains_open": True,
+        "cleanup_needed": True,
+        "close_used": False,
+        "discard_used": False,
+        "attempt_count": 0,
+        "success_confirmation": False,
+    }
+
+
+class JobSearchSafetyReminder(Exception):
+    """Stop only the current application when LinkedIn shows a safety warning."""
+
+
+def _find_job_search_safety_reminder(browser):
+    for dialog in _visible_modal_dialogs(browser):
+        try:
+            title = dialog.find_elements(
+                By.XPATH,
+                './/*[normalize-space(.)="Job search safety reminder"]',
+            )
+            review_action = dialog.find_elements(
+                By.XPATH,
+                './/*[normalize-space(.)="Review job post"]',
+            )
+            continue_action = dialog.find_elements(
+                By.XPATH,
+                './/*[normalize-space(.)="Continue applying"]',
+            )
+            if title or (review_action and continue_action):
+                return dialog
+        except Exception:
+            continue
+    return None
+
+
+def _close_job_search_safety_reminder(browser) -> tuple[bool, bool]:
+    """Return (detected, safely_closed) without clicking warning actions."""
+    dialog = _find_job_search_safety_reminder(browser)
+    if dialog is None:
+        return False, False
+    try:
+        close_buttons = dialog.find_elements(
+            By.XPATH,
+            './/button['
+            'contains(@class,"artdeco-modal__dismiss") or '
+            '@aria-label="Dismiss" or @aria-label="Close" or '
+            '@aria-label="Cerrar"]',
+        )
+    except Exception:
+        close_buttons = []
+    for button in close_buttons:
+        try:
+            label = " ".join(str(button.text or "").casefold().split())
+            if label in {"continue applying", "review job post"}:
+                continue
+            if button.is_displayed() and button.is_enabled():
+                button.click()
+                return True, True
+        except Exception:
+            continue
+    return True, False
+
+
+def _visible_enabled_submit_button(modal):
+    try:
+        if hasattr(modal, "is_displayed") and not modal.is_displayed():
+            return None
+        buttons = modal.find_elements(
+            By.XPATH,
+            './/button['
+            'normalize-space(.)="Submit application" or '
+            './/span[normalize-space(.)="Submit application"]]',
+        )
+    except Exception:
+        return None
+    for button in buttons:
+        try:
+            if (
+                button.is_displayed()
+                and button.is_enabled()
+                and str(button.get_attribute("aria-disabled") or "").casefold()
+                != "true"
+                and str(button.get_attribute("disabled") or "").casefold()
+                not in {"true", "disabled"}
+            ):
+                return button
+        except Exception:
+            continue
+    return None
+
+
+def _final_review_reached_from_submit_button(
+    modal,
+    unresolved_required: set,
+) -> bool:
+    if unresolved_required or _collect_invalid_required_fields(modal):
+        return False
+    return _visible_enabled_submit_button(modal) is not None
 
 
 
@@ -1036,11 +3105,12 @@ def apply_to_jobs(search_terms: list[str]) -> None:
     applied_jobs = get_applied_job_ids()
     rejected_jobs = set()
     blacklisted_companies = set()
-    global current_city, failed_count, skip_count, easy_applied_count, external_jobs_count, tabs_count, pause_before_submit, pause_at_failed_question, useNewResume
+    global current_city, failed_count, skip_count, easy_applied_count, external_jobs_count, tabs_count, pause_before_submit, pause_at_failed_question, useNewResume, ai_review_context
     current_city = current_city.strip()
 
     if randomize_search_order:  shuffle(search_terms)
     for searchTerm in search_terms:
+        stop_current_search_term_scan = False
         driver.get(f"https://www.linkedin.com/jobs/search/?keywords={searchTerm}")
         print_lg("\n________________________________________________________________________________________________________________________\n")
         print_lg(f'\n>>>> Now searching for "{searchTerm}" <<<<\n\n')
@@ -1066,7 +3136,20 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     if current_count >= switch_number: break
                     print_lg("\n-@-\n")
 
+                    prior_job_id = str(
+                        globals().get("ai_review_context", {}).get("job_id", "")
+                    )
+                    cleanup_guard = _guard_next_job_click(driver, prior_job_id)
+                    if not cleanup_guard["success"]:
+                        stop_current_search_term_scan = True
+                        break
+
                     job_id,title,company,work_location,work_style,skip = get_job_main_details(job, blacklisted_companies, rejected_jobs)
+                    ai_review_context = {
+                        "job_id": job_id,
+                        "company": company,
+                        "job_title": title,
+                    }
                     
                     if skip: continue
                     # Redundant fail safe check for applied jobs!
@@ -1089,6 +3172,10 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     reposted = False
                     questions_list = None
                     screenshot_name = "Not Available"
+                    stop_after_submitted_cleanup = False
+                    post_submit_success_confirmed = False
+                    post_submit_success_modal_detected = False
+                    post_submit_state = None
 
                     try:
                         rejected_jobs, blacklisted_companies, jobs_top_card = check_blacklist(rejected_jobs,job_id,company,blacklisted_companies)
@@ -1158,9 +3245,25 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     uploaded = False
                     # Case 1: Easy Apply Button
                     if try_xp(driver, ".//button[contains(@class,'jobs-apply-button') and contains(@class, 'artdeco-button--3') and contains(@aria-label, 'Easy')]"):
+                        unresolved_required = set()
                         try: 
                             try:
                                 errored = ""
+                                safety_warning_active = False
+                                safety_detected, safety_closed = (
+                                    _close_job_search_safety_reminder(driver)
+                                )
+                                if safety_detected:
+                                    safety_warning_active = True
+                                    _record_review_outcome(
+                                        "safety_warning_skipped",
+                                        "job_search_safety_reminder",
+                                    )
+                                    raise JobSearchSafetyReminder(
+                                        "Safety reminder closed"
+                                        if safety_closed
+                                        else "Safety reminder could not be closed safely"
+                                    )
                                 modal = find_by_class(driver, "jobs-easy-apply-modal")
                                 wait_span_click(modal, "Next", 1)
                                 # if description != "Unknown":
@@ -1168,23 +3271,67 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                 resume = "Previous resume"
                                 next_button = True
                                 questions_list = set()
+                                reached_review = False
+                                final_review_reason = ""
                                 next_counter = 0
+                                repaired_page_signatures = set()
                                 while next_button:
+                                    safety_detected, safety_closed = (
+                                        _close_job_search_safety_reminder(driver)
+                                    )
+                                    if safety_detected:
+                                        safety_warning_active = True
+                                        _record_review_outcome(
+                                            "safety_warning_skipped",
+                                            "job_search_safety_reminder",
+                                        )
+                                        raise JobSearchSafetyReminder(
+                                            "Safety reminder closed"
+                                            if safety_closed
+                                            else "Safety reminder could not be closed safely"
+                                        )
                                     next_counter += 1
-                                    if next_counter >= 15: 
-                                        if pause_at_failed_question:
-                                            screenshot(driver, job_id, "Needed manual intervention for failed question")
-                                            pyautogui.alert("Couldn't answer one or more questions.\nPlease click \"Continue\" once done.\nDO NOT CLICK Back, Next or Review button in LinkedIn.\n\n\n\n\nYou can turn off \"Pause at failed question\" setting in config.py", "Help Needed", "Continue")
-                                            next_counter = 1
-                                            continue
+                                    questions_list = answer_questions(modal, questions_list, work_location, title, unresolved_required, job_description=description)
+                                    invalid_required = _collect_invalid_required_fields(modal)
+                                    page_repaired = False
+                                    if unresolved_required or invalid_required:
+                                        repaired = repair_invalid_required_fields(
+                                            modal,
+                                            work_location,
+                                            title,
+                                            description,
+                                            unresolved_required,
+                                            repaired_page_signatures,
+                                        )
+                                        if not repaired:
+                                            raise Exception("Required application fields remain unresolved")
+                                        page_repaired = True
+
+                                    if page_repaired:
+                                        next_counter = 1
+
+                                    if next_counter >= 15:
                                         if questions_list: print_lg("Stuck for one or some of the following questions...", questions_list)
                                         screenshot_name = screenshot(driver, job_id, "Failed at questions")
                                         errored = "stuck"
+                                        _record_review_outcome(
+                                            "application_discarded",
+                                            "failed_question_unresolved",
+                                        )
                                         raise Exception("Seems like stuck in a continuous loop of next, probably because of new questions.")
-                                    questions_list = answer_questions(modal, questions_list, work_location, job_description=description)
 
                                     if useNewResume and not uploaded: uploaded, resume = upload_resume(modal, default_resume_path)
-                                    try: next_button = modal.find_element(By.XPATH, './/span[normalize-space(.)="Review"]') 
+                                    if _final_review_reached_from_submit_button(
+                                        modal, unresolved_required
+                                    ):
+                                        reached_review = True
+                                        final_review_reason = (
+                                            "final_review_detected_from_submit_button"
+                                        )
+                                        break
+                                    try:
+                                        next_button = modal.find_element(By.XPATH, './/span[normalize-space(.)="Review"]')
+                                        reached_review = True
                                     except NoSuchElementException:  next_button = modal.find_element(By.XPATH, './/button[contains(span, "Next")]')
                                     try: 
                                         next_button.click()
@@ -1192,12 +3339,52 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                     except ElementClickInterceptedException: break    # Happens when it tries to click Next button in About Company photos section
                                     buffer(click_gap)
 
-                            except NoSuchElementException: errored = "nose"
+                            except NoSuchElementException:
+                                safety_detected, safety_closed = (
+                                    _close_job_search_safety_reminder(driver)
+                                )
+                                if safety_detected:
+                                    safety_warning_active = True
+                                    _record_review_outcome(
+                                        "safety_warning_skipped",
+                                        "job_search_safety_reminder",
+                                    )
+                                    raise JobSearchSafetyReminder(
+                                        "Safety reminder closed"
+                                        if safety_closed
+                                        else "Safety reminder could not be closed safely"
+                                    )
+                                errored = "nose"
                             finally:
+                                if safety_warning_active:
+                                    raise
                                 if questions_list and errored != "stuck": 
                                     print_lg("Answered the following questions...", questions_list)
                                     print("\n\n" + "\n".join(str(question) for question in questions_list) + "\n\n")
-                                wait_span_click(driver, "Review", 1, scrollTop=True)
+                                if (
+                                    not unresolved_required
+                                    and wait_span_click(
+                                        driver, "Review", 1, scrollTop=True
+                                    )
+                                ):
+                                    reached_review = True
+                                if (
+                                    not reached_review
+                                    and _final_review_reached_from_submit_button(
+                                        modal, unresolved_required
+                                    )
+                                ):
+                                    reached_review = True
+                                    final_review_reason = (
+                                        "final_review_detected_from_submit_button"
+                                    )
+                                if unresolved_required or not reached_review or current_count >= switch_number:
+                                    reason = "unresolved_required_fields" if unresolved_required else "review_not_reached_or_limit"
+                                    print_lg(f"Submit guard blocked application reason_code={reason}")
+                                    raise Exception(f"Submit guard blocked application: {reason}")
+                                _record_review_outcome(
+                                    "reached_review", final_review_reason
+                                )
                                 cur_pause_before_submit = pause_before_submit
                                 if errored != "stuck" and cur_pause_before_submit:
                                     decision = pyautogui.confirm('1. Please verify your information.\n2. If you edited something, please return to this final screen.\n3. DO NOT CLICK "Submit Application".\n\n\n\n\nYou can turn off "Pause before submit" setting in config.py\nTo TEMPORARILY disable pausing, click "Disable Pause"', "Confirm your information",["Disable Pause", "Discard Application", "Submit Application"])
@@ -1206,26 +3393,101 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                     # try_xp(modal, ".//span[normalize-space(.)='Review']")
                                 follow_company(modal)
                                 if wait_span_click(driver, "Submit application", 2, scrollTop=True): 
-                                    date_applied = datetime.now()
-                                    if not wait_span_click(driver, "Done", 2): actions.send_keys(Keys.ESCAPE).perform()
-                                elif errored != "stuck" and cur_pause_before_submit and "Yes" in pyautogui.confirm("You submitted the application, didn't you 😒?", "Failed to find Submit Application!", ["Yes", "No"]):
-                                    date_applied = datetime.now()
-                                    wait_span_click(driver, "Done", 2)
+                                    post_submit_state = _wait_for_post_submit_state(
+                                        driver,
+                                        modal,
+                                        job,
+                                        unresolved_required,
+                                    )
+                                    if post_submit_state["status"] == "success":
+                                        date_applied = datetime.now()
+                                        post_submit_success_confirmed = True
+                                        post_submit_success_modal_detected = bool(
+                                            post_submit_state[
+                                                "success_modal_detected"
+                                            ]
+                                        )
+                                        ai_review_context["application_submitted"] = True
+                                        _record_review_outcome("submitted")
+                                        _log_post_submit_state(
+                                            job_id,
+                                            post_submit_state,
+                                            success_accounted=True,
+                                            cleanup_result="pending",
+                                        )
+                                    elif post_submit_state["status"] == "safety_warning":
+                                        raise JobSearchSafetyReminder(
+                                            "Safety reminder detected after submit"
+                                        )
+                                    elif post_submit_state["status"] == "validation_error":
+                                        raise Exception(
+                                            "Post-submit validation blocked submission"
+                                        )
+                                    else:
+                                        _log_post_submit_state(
+                                            job_id,
+                                            post_submit_state,
+                                            success_accounted=False,
+                                            cleanup_result="timeout",
+                                        )
+                                        raise Exception(
+                                            "Post-submit confirmation timed out"
+                                        )
                                 else:
                                     print_lg("Since, Submit Application failed, discarding the job application...")
                                     # if screenshot_name == "Not Available":  screenshot_name = screenshot(driver, job_id, "Failed to click Submit application")
                                     # else:   screenshot_name = [screenshot_name, screenshot(driver, job_id, "Failed to click Submit application")]
-                                    if errored == "nose": raise Exception("Failed to click Submit application 😑")
+                                    raise Exception("Failed to click Submit application")
 
 
-                        except Exception as e:
-                            print_lg("Failed to Easy apply!")
-                            # print_lg(e)
-                            critical_error_log("Somewhere in Easy Apply process",e)
-                            failed_job(job_id, job_link, resume, date_listed, "Problem in Easy Applying", e, application_link, screenshot_name)
-                            failed_count += 1
-                            discard_job()
+                        except JobSearchSafetyReminder as e:
+                            cleanup_result = _cleanup_easy_apply_modal(driver, job_id)
+                            failed_job(
+                                job_id,
+                                job_link,
+                                resume,
+                                date_listed,
+                                "Job search safety reminder",
+                                e,
+                                "Skipped",
+                                screenshot_name,
+                            )
+                            rejected_jobs.add(job_id)
+                            skip_count += 1
+                            if not cleanup_result["success"]:
+                                stop_current_search_term_scan = True
+                                break
                             continue
+                        except Exception as e:
+                            cleanup_result = _cleanup_easy_apply_modal(driver, job_id)
+                            if cleanup_result.get("success_confirmation"):
+                                if not ai_review_context.get("application_submitted"):
+                                    date_applied = datetime.now()
+                                    ai_review_context["application_submitted"] = True
+                                    _record_review_outcome("submitted")
+                                post_submit_success_confirmed = True
+                                post_submit_success_modal_detected = True
+                                post_submit_state = {
+                                    "status": "success",
+                                    "success_modal_detected": True,
+                                    "applied_state_detected": (
+                                        _job_applied_state_detected(job, driver)
+                                    ),
+                                    "visible_overlay_count": len(
+                                        _visible_top_level_overlays(driver)
+                                    ),
+                                    "modal_remains_open": True,
+                                }
+                            else:
+                                print_lg("Failed to Easy apply!")
+                                # print_lg(e)
+                                critical_error_log("Somewhere in Easy Apply process",e)
+                                failed_job(job_id, job_link, resume, date_listed, "Problem in Easy Applying", e, application_link, screenshot_name)
+                                failed_count += 1
+                                if not cleanup_result["success"]:
+                                    stop_current_search_term_scan = True
+                                    break
+                                continue
                     else:
                         # Case 2: Apply externally
                         skip, application_link, tabs_count = external_apply(pagination_element, job_id, job_link, resume, date_listed, application_link, screenshot_name)
@@ -1242,6 +3504,41 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     if application_link == "Easy Applied": easy_applied_count += 1
                     else:   external_jobs_count += 1
                     applied_jobs.add(job_id)
+                    if post_submit_success_confirmed:
+                        if post_submit_success_modal_detected:
+                            success_cleanup = _cleanup_confirmed_success_modal(
+                                driver, job_id
+                            )
+                            if success_cleanup is None:
+                                success_cleanup = {
+                                    "success": True,
+                                    "reason_code": "easy_apply_modal_closed",
+                                    "modal_remains_open": False,
+                                }
+                        else:
+                            success_cleanup = {
+                                "success": True,
+                                "reason_code": "easy_apply_modal_closed",
+                                "modal_remains_open": False,
+                            }
+                        stop_after_submitted_cleanup = not success_cleanup["success"]
+                        if stop_after_submitted_cleanup:
+                            _record_review_outcome(
+                                "submitted",
+                                "post_apply_success_modal_cleanup_failed",
+                            )
+                        _log_post_submit_state(
+                            job_id,
+                            post_submit_state or {},
+                            success_accounted=True,
+                            cleanup_result=success_cleanup["reason_code"],
+                            modal_remains_open=success_cleanup[
+                                "modal_remains_open"
+                            ],
+                        )
+                    if stop_after_submitted_cleanup:
+                        stop_current_search_term_scan = True
+                        break
                 
                 # Pause update---
                 # --- Anti-rate-limit pause between applications ---
@@ -1252,6 +3549,10 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                 # from random import uniform
                 # sleep(uniform(1, 5))   # wait 5–10 seconds between applications
                 # print_lg(f"🕒 Short pause between applications to mimic human behavior...")
+
+
+                if stop_current_search_term_scan:
+                    break
 
 
 
@@ -1288,7 +3589,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
         except Exception as e:
             print_lg("Failed to find Job listings!")
             critical_error_log("In Applier", e)
-            print_lg(driver.page_source, pretty=True)
+            print_lg("Job listing scan failed; full page diagnostics suppressed.")
             # print_lg(e)
 
         
@@ -1316,7 +3617,8 @@ linkedIn_tab = False
 
 def main() -> None:
     try:
-        global linkedIn_tab, tabs_count, useNewResume, aiClient
+        global linkedIn_tab, tabs_count, useNewResume, aiClient, ai_answer_review_queue
+        ai_answer_review_queue = AIAnswerReviewQueue()
         alert_title = "Error Occurred. Closing Browser!"
         total_runs = 1        
         validate_config()
@@ -1364,11 +3666,22 @@ def main() -> None:
                 break
         
 
-    except NoSuchWindowException:   pass
+    except NoSuchWindowException:
+        if ai_answer_review_queue is not None:
+            ai_answer_review_queue.record_run_interrupted()
+    except KeyboardInterrupt:
+        if ai_answer_review_queue is not None:
+            ai_answer_review_queue.record_run_interrupted()
+        raise
     except Exception as e:
+        if ai_answer_review_queue is not None:
+            ai_answer_review_queue.record_run_interrupted()
         critical_error_log("In Applier Main", e)
         pyautogui.alert(e,alert_title)
     finally:
+        if ai_answer_review_queue is not None:
+            ai_answer_review_queue.print_summary()
+            ai_answer_review_queue.close()
         print_lg("\n\nTotal runs:                     {}".format(total_runs))
         print_lg("Jobs Easy Applied:              {}".format(easy_applied_count))
         print_lg("External job links collected:   {}".format(external_jobs_count))
