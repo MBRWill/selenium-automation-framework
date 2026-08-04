@@ -1,18 +1,20 @@
 """Narrow, privacy-safe Gemini fallback for unmatched application questions."""
 from dataclasses import dataclass
 import json
-import os
 from pathlib import Path
 import re
 import time
 import unicodedata
 from openai import OpenAI
+from modules.ai.gemini_config import (
+    GEMINI_OPENAI_ENDPOINT,
+    load_gemini_config,
+)
 from config.questions import (
     earliest_start_date,
     notice_period,
 )
 _PROFILE_PATH = Path(__file__).resolve().parents[2] / "config" / "candidate_profile.json"
-_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/openai/"
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 _CONTACT_WORDS = ("first name", "middle name", "last name", "full name", "email", "phone")
 _PROHIBITED_INFERENCE_WORDS = (
@@ -1533,12 +1535,11 @@ def resolve_multilingual_language_question(
 ) -> MultilingualLanguageResolution:
     """Classify and answer one field using only bounded language information."""
     profile = profile if isinstance(profile, dict) else _load_profile()
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-    if not api_key or not model:
+    config = load_gemini_config()
+    if not config.configured:
         return MultilingualLanguageResolution(
             None,
-            UnknownQuestionAnswer(False, reason_code="gemini_not_configured"),
+            UnknownQuestionAnswer(False, reason_code=config.reason_code),
         )
     options = [str(option) for option in (visible_options or [])]
     language_facts = _minimal_confirmed_language_facts(profile)
@@ -1572,9 +1573,13 @@ def resolve_multilingual_language_question(
         f"\nConfirmed language facts: {json.dumps(language_facts, ensure_ascii=False)}"
         f"\nAnswer policy: {_ASSERTIVE_ANSWER_POLICY}"
     )
-    client = OpenAI(api_key=api_key, base_url=_ENDPOINT, max_retries=0)
+    client = OpenAI(
+        api_key=config.api_key,
+        base_url=GEMINI_OPENAI_ENDPOINT,
+        max_retries=0,
+    )
     messages = [{"role": "user", "content": prompt}]
-    raw, request_count = _request(client, model, messages)
+    raw, request_count = _request(client, config.model, messages)
     if raw is None:
         return MultilingualLanguageResolution(
             None,
@@ -1615,7 +1620,9 @@ def resolve_multilingual_language_question(
             "numeric_constraints."
         ),
     }]
-    repaired, repair_count = _request(client, model, repair_messages)
+    repaired, repair_count = _request(
+        client, config.model, repair_messages
+    )
     request_count += repair_count
     repaired_value = _parse(repaired)
     repaired_resolution = (
@@ -1746,11 +1753,10 @@ def answer_unknown_question(
         for word in _PROHIBITED_INFERENCE_WORDS
     ):
         return UnknownQuestionAnswer(False, reason_code="high_risk_exact_fact_missing")
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-    if not api_key or not model:
+    config = load_gemini_config()
+    if not config.configured:
         return _apply_experience_years_floor(
-            UnknownQuestionAnswer(False, reason_code="gemini_not_configured"),
+            UnknownQuestionAnswer(False, reason_code=config.reason_code),
             question_text,
             field_type,
         )
@@ -1801,7 +1807,11 @@ def answer_unknown_question(
         f"Job description: {job_description[:1200]}\nConfirmed answer sheet: {answer_sheet}\n"
         f"Verified candidate facts: {context}"
     )
-    client = OpenAI(api_key=api_key, base_url=_ENDPOINT, max_retries=0)
+    client = OpenAI(
+        api_key=config.api_key,
+        base_url=GEMINI_OPENAI_ENDPOINT,
+        max_retries=0,
+    )
     prompt = re.sub(
         r"(?i)(^|(?<=[.!?]))\s*[^.!?\n]*\bconservative\b[^.!?\n]*[.!?]",
         " ",
@@ -1809,7 +1819,7 @@ def answer_unknown_question(
     )
     messages = [{"role": "user", "content": prompt}]
     messages[0]["content"] += "\n" + _ASSERTIVE_ANSWER_POLICY
-    raw, provider_request_count = _request(client, model, messages)
+    raw, provider_request_count = _request(client, config.model, messages)
     provider_request_count += language_request_count
     if raw is None:
         return _apply_experience_years_floor(
@@ -1824,7 +1834,9 @@ def answer_unknown_question(
     parsed = _parse(raw)
     if parsed is None:
         repair = messages + [{"role": "user", "content": f"Return only a corrected JSON object shaped as {schema}."}]
-        repaired, repair_request_count = _request(client, model, repair)
+        repaired, repair_request_count = _request(
+            client, config.model, repair
+        )
         provider_request_count += repair_request_count
         if repaired is None:
             return _apply_experience_years_floor(

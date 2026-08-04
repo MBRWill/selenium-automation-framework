@@ -1,16 +1,29 @@
-import os
+from pathlib import Path
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from openai import OpenAI
 
+from modules.ai.gemini_config import (
+    GEMINI_OPENAI_ENDPOINT,
+    load_gemini_config,
+)
 
-api_key = os.getenv("GEMINI_API_KEY")
 
-if not api_key:
-    raise RuntimeError("GEMINI_API_KEY is not set")
+config = load_gemini_config()
+
+if not config.configured:
+    raise SystemExit(config.reason_code)
 
 
 client = OpenAI(
-    api_key=api_key,
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    api_key=config.api_key,
+    base_url=GEMINI_OPENAI_ENDPOINT,
+    max_retries=0,
 )
 
 
@@ -30,4 +43,3 @@ try:
 except Exception as error:
     print("Failed to list Gemini models:")
     print(type(error).__name__)
-    print(error)
