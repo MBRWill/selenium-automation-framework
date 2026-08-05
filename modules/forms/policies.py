@@ -21,6 +21,7 @@ class SemanticCategory(str, Enum):
     DRIVING_LICENCE_POSSESSION = "driving_licence_possession"
     EMPLOYMENT_HISTORY = "employment_history"
     LEGAL_CRIMINAL_DECLARATION = "legal_criminal_declaration"
+    IDENTITY_EXACT = "identity_exact"
     SALARY_EXACT = "salary_exact"
     LANGUAGE_EXACT_LEVEL = "language_exact_level"
     ORDINARY_EXPERIENCE = "ordinary_experience"
@@ -79,6 +80,7 @@ class SemanticPolicy:
         SemanticCategory.DRIVING_LICENCE_POSSESSION: "qualifications.driving_licence",
         SemanticCategory.EMPLOYMENT_HISTORY: "employment.history",
         SemanticCategory.LEGAL_CRIMINAL_DECLARATION: "legal.criminal_declaration",
+        SemanticCategory.IDENTITY_EXACT: "identity.verified",
         SemanticCategory.SALARY_EXACT: "compensation.salary",
         SemanticCategory.LANGUAGE_EXACT_LEVEL: "languages.verified_level",
     }
@@ -146,6 +148,21 @@ class SemanticPolicy:
         )
 
     def _category(self, text: str, required: bool) -> SemanticCategory:
+        if self._contains(
+            text,
+            "legal name",
+            "full name",
+            "date of birth",
+            "birth date",
+            "passport number",
+            "national id",
+            "nombre legal",
+            "nombre completo",
+            "fecha de nacimiento",
+            "numero de pasaporte",
+            "documento de identidad",
+        ):
+            return SemanticCategory.IDENTITY_EXACT
         if self._contains(
             text,
             "criminal",

@@ -393,6 +393,11 @@ class AnswerResolver:
     ) -> AnswerResult | None:
         if decision.exact_only:
             return None
+        provider_request_count = (
+            rejected_provider_answer.request_count
+            if rejected_provider_answer is not None
+            else 0
+        )
         if field.kind is FieldKind.NUMBER:
             value = self._compatible_number(None, field.constraints, field.numeric_default)
             if value is not None:
@@ -403,6 +408,7 @@ class AnswerResolver:
                     if rejected_provider_answer is not None
                     else "numeric_best_effort_default",
                     requires_review=True,
+                    provider_request_count=provider_request_count,
                 )
         if field.kind in {FieldKind.TEXT, FieldKind.TEXTAREA} and field.required:
             value = self._compatible_text("Not provided", field.constraints)
@@ -412,6 +418,7 @@ class AnswerResolver:
                     AnswerSource.DEFAULT,
                     "required_text_best_effort_default",
                     requires_review=True,
+                    provider_request_count=provider_request_count,
                 )
         if field.kind in {FieldKind.SELECT, FieldKind.RADIO}:
             positive = self._positive_option(field.visible_options)
@@ -423,6 +430,7 @@ class AnswerResolver:
                     AnswerSource.DEFAULT,
                     "ordinary_yes_default",
                     requires_review=True,
+                    provider_request_count=provider_request_count,
                 )
             available = self._available_options(field.visible_options)
             if field.required and available and not is_yes_no:
@@ -431,6 +439,7 @@ class AnswerResolver:
                     AnswerSource.DEFAULT,
                     "required_visible_option_default",
                     requires_review=True,
+                    provider_request_count=provider_request_count,
                 )
         if field.kind is FieldKind.CHECKBOX and field.required and decision.allow_yes_no_default:
             return self._resolved(
@@ -438,6 +447,7 @@ class AnswerResolver:
                 AnswerSource.DEFAULT,
                 "required_ordinary_checkbox_default",
                 requires_review=True,
+                provider_request_count=provider_request_count,
             )
         return None
 
@@ -544,6 +554,7 @@ class AnswerResolver:
         reason_code: str,
         *,
         requires_review: bool = False,
+        provider_request_count: int = 0,
     ) -> AnswerResult:
         return AnswerResult(
             status=AnswerStatus.RESOLVED,
@@ -552,6 +563,7 @@ class AnswerResolver:
             confidence=Confidence.LOW if requires_review else Confidence.HIGH,
             reason_code=reason_code,
             requires_review=requires_review,
+            provider_request_count=provider_request_count,
         )
 
     @staticmethod

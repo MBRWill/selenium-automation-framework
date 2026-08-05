@@ -69,6 +69,23 @@ class WriteStatus(str, Enum):
     FAILED = "failed"
 
 
+class OrchestratorStatus(str, Enum):
+    READY_FOR_NAVIGATION = "ready_for_navigation"
+    RETRY_REQUIRED = "retry_required"
+    BLOCKED_PROTECTED_FACT = "blocked_protected_fact"
+    BLOCKED_TYPE_IMPOSSIBLE = "blocked_type_impossible"
+    FAILED = "failed"
+
+
+class FieldProcessingStatus(str, Enum):
+    PRESERVED = "preserved"
+    WRITTEN = "written"
+    REPAIRED = "repaired"
+    VALID = "valid"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class FieldConstraints:
     min_value: Decimal | None = None
@@ -226,10 +243,12 @@ class ReviewRecord:
     validation_message: str
     provider_request_count: int = 0
     review_status: str = "pending"
+    application_id: str = ""
 
     def as_excel_row(self) -> dict[str, str]:
         """Return scalar values for a later CSV/Excel persistence adapter."""
         return {
+            "application_id": self.application_id,
             "job_id": self.job_id,
             "company": self.company,
             "job_title": self.job_title,
@@ -442,3 +461,62 @@ def _diagnostic_value(value: str | bool | None) -> str:
     if isinstance(value, bool) or value is None:
         return repr(value)
     return f"<text length={len(str(value))}>"
+
+
+@dataclass(frozen=True, repr=False)
+class FieldProcessingResult:
+    field_key: str
+    status: FieldProcessingStatus
+    answer_result: AnswerResult | None
+    write_result: WriteResult | None
+    validation_issues: tuple[ValidationIssue, ...]
+    repair_attempts: int
+    review_recorded: bool
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        if self.repair_attempts < 0:
+            raise ValueError("repair_attempts must not be negative")
+
+    def __repr__(self) -> str:
+        return (
+            "FieldProcessingResult("
+            f"field_key={self.field_key!r}, status={self.status.value!r}, "
+            f"has_answer={self.answer_result is not None!r}, "
+            f"has_write_result={self.write_result is not None!r}, "
+            f"validation_issue_count={len(self.validation_issues)}, "
+            f"repair_attempts={self.repair_attempts}, "
+            f"review_recorded={self.review_recorded!r}, "
+            f"reason_code={self.reason_code!r})"
+        )
+
+
+@dataclass(frozen=True, repr=False)
+class FormPageResult:
+    status: OrchestratorStatus
+    field_results: tuple[FieldProcessingResult, ...]
+    unresolved_fields: tuple[str, ...]
+    validation_issues: tuple[ValidationIssue, ...]
+    review_records: tuple[ReviewRecord, ...]
+    provider_request_count: int
+    repair_rounds: int
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        if self.provider_request_count < 0:
+            raise ValueError("provider_request_count must not be negative")
+        if self.repair_rounds < 0:
+            raise ValueError("repair_rounds must not be negative")
+
+    def __repr__(self) -> str:
+        return (
+            "FormPageResult("
+            f"status={self.status.value!r}, "
+            f"field_count={len(self.field_results)}, "
+            f"unresolved_count={len(self.unresolved_fields)}, "
+            f"validation_issue_count={len(self.validation_issues)}, "
+            f"review_record_count={len(self.review_records)}, "
+            f"provider_request_count={self.provider_request_count}, "
+            f"repair_rounds={self.repair_rounds}, "
+            f"reason_code={self.reason_code!r})"
+        )
