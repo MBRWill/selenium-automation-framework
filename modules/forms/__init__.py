@@ -5,9 +5,15 @@ from modules.forms.models import (
     AnswerSource,
     AnswerStatus,
     Confidence,
+    ControlOption,
+    ControlSnapshot,
+    ControlValidity,
+    ExtractedField,
+    ExtractionContext,
     FieldConstraints,
     FieldKind,
     FormField,
+    FieldLocator,
     ProviderRequest,
     ProviderResult,
     RepairRequest,
@@ -16,6 +22,10 @@ from modules.forms.models import (
     ReviewRecord,
     ValidationIssue,
     ValidationIssueKind,
+    ValidationState,
+    WriteRequest,
+    WriteResult,
+    WriteStatus,
 )
 from modules.forms.policies import (
     PolicyDecision,
@@ -31,6 +41,9 @@ from modules.forms.profile import (
 )
 from modules.forms.provider import AnswerProvider
 from modules.forms.resolver import AnswerResolver, ReviewQueue
+from modules.forms.controls import FieldControl, FieldControlProvider
+from modules.forms.extractor import FieldExtractor
+from modules.forms.writer import FieldWriter
 
 __all__ = (
     "AnswerProvider",
@@ -39,8 +52,18 @@ __all__ = (
     "AnswerSource",
     "AnswerStatus",
     "Confidence",
+    "ControlOption",
+    "ControlSnapshot",
+    "ControlValidity",
+    "ExtractedField",
+    "ExtractionContext",
+    "FieldControl",
+    "FieldControlProvider",
+    "FieldExtractor",
     "FieldConstraints",
     "FieldKind",
+    "FieldLocator",
+    "FieldWriter",
     "FormField",
     "MappingProfileFactProvider",
     "PolicyDecision",
@@ -58,5 +81,9 @@ __all__ = (
     "TruthPolicy",
     "ValidationIssue",
     "ValidationIssueKind",
+    "ValidationState",
+    "WriteRequest",
+    "WriteResult",
+    "WriteStatus",
     "normalize_question",
 )

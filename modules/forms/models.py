@@ -61,6 +61,14 @@ class RepairStatus(str, Enum):
     UNRESOLVED = "unresolved"
 
 
+class WriteStatus(str, Enum):
+    SKIPPED_PRESERVED = "skipped_preserved"
+    WRITTEN = "written"
+    VERIFIED = "verified"
+    RETRY_REQUIRED = "retry_required"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class FieldConstraints:
     min_value: Decimal | None = None
@@ -242,3 +250,195 @@ class ReviewRecord:
             "provider_request_count": str(self.provider_request_count),
             "review_status": self.review_status,
         }
+
+
+@dataclass(frozen=True)
+class ControlOption:
+    text: str
+    value: str
+    selector: str = ""
+    visible: bool = True
+    enabled: bool = True
+    selected: bool = False
+    placeholder: bool = False
+
+
+@dataclass(frozen=True, repr=False)
+class ControlValidity:
+    browser_valid: bool = True
+    validation_message: str = ""
+    aria_invalid: bool | None = None
+    value_missing: bool = False
+    type_mismatch: bool = False
+    range_underflow: bool = False
+    range_overflow: bool = False
+    step_mismatch: bool = False
+    too_short: bool = False
+    too_long: bool = False
+
+    def __repr__(self) -> str:
+        return (
+            "ControlValidity("
+            f"browser_valid={self.browser_valid!r}, "
+            f"aria_invalid={self.aria_invalid!r}, "
+            f"value_missing={self.value_missing!r})"
+        )
+
+
+@dataclass(frozen=True, repr=False)
+class ControlSnapshot:
+    container_selector: str
+    control_selector: str
+    option_selectors: tuple[str, ...]
+    tag_name: str
+    input_type: str
+    labels: tuple[str, ...]
+    accessible_text: str
+    attributes: tuple[tuple[str, str], ...]
+    current_value: str | bool | None
+    required: bool
+    checked: bool | None
+    options: tuple[ControlOption, ...]
+    constraints: FieldConstraints
+    validity: ControlValidity
+
+    def __repr__(self) -> str:
+        return (
+            "ControlSnapshot("
+            f"tag_name={self.tag_name!r}, input_type={self.input_type!r}, "
+            f"required={self.required!r}, options={len(self.options)}, "
+            f"has_value={self.current_value is not None})"
+        )
+
+
+@dataclass(frozen=True, repr=False)
+class FieldLocator:
+    container_selector: str
+    control_selector: str
+    option_selectors: tuple[str, ...] = ()
+    stable_attributes: tuple[tuple[str, str], ...] = ()
+
+    _SAFE_ATTRIBUTE_NAMES = frozenset({
+        "id",
+        "name",
+        "type",
+        "role",
+        "autocomplete",
+        "aria-describedby",
+        "data-test-id",
+        "data-test-form-element",
+    })
+
+    def __post_init__(self) -> None:
+        selectors = (
+            self.container_selector,
+            self.control_selector,
+            *self.option_selectors,
+        )
+        if not self.control_selector.strip():
+            raise ValueError("control_selector is required")
+        if any("<" in item or ">" in item or len(item) > 512 for item in selectors):
+            raise ValueError("locators must contain selectors, not page markup")
+        if any(name not in self._SAFE_ATTRIBUTE_NAMES for name, _ in self.stable_attributes):
+            raise ValueError("stable_attributes contains a non-safe attribute")
+
+    def __repr__(self) -> str:
+        return (
+            "FieldLocator("
+            f"has_container={bool(self.container_selector)!r}, "
+            f"option_count={len(self.option_selectors)}, "
+            f"stable_attribute_count={len(self.stable_attributes)})"
+        )
+
+
+@dataclass(frozen=True)
+class ExtractionContext:
+    application_id: str = ""
+    job_id: str = ""
+    company: str = ""
+    job_title: str = ""
+
+
+@dataclass(frozen=True, repr=False)
+class ValidationState:
+    browser_valid: bool
+    validation_message: str
+    aria_invalid: bool | None
+    required_missing: bool
+    type_mismatch: bool
+    range_underflow: bool
+    range_overflow: bool
+    step_mismatch: bool
+    too_short: bool
+    too_long: bool
+    option_required: bool
+
+    def __repr__(self) -> str:
+        return (
+            "ValidationState("
+            f"browser_valid={self.browser_valid!r}, "
+            f"aria_invalid={self.aria_invalid!r}, "
+            f"required_missing={self.required_missing!r})"
+        )
+
+
+@dataclass(frozen=True, repr=False)
+class ExtractedField:
+    field: FormField
+    locator: FieldLocator
+    normalized_question: str
+    validation_state: ValidationState
+    safe_metadata: tuple[tuple[str, str], ...] = ()
+
+    def __repr__(self) -> str:
+        return (
+            "ExtractedField("
+            f"field_key={self.field.field_key!r}, kind={self.field.kind.value!r}, "
+            f"required={self.field.required!r}, "
+            f"has_existing_value={self.field.existing_value is not None})"
+        )
+
+
+@dataclass(frozen=True, repr=False)
+class WriteRequest:
+    extracted_field: ExtractedField
+    answer_result: AnswerResult
+
+    def __repr__(self) -> str:
+        return (
+            "WriteRequest("
+            f"field_key={self.extracted_field.field.field_key!r}, "
+            f"status={self.answer_result.status.value!r}, "
+            f"source={self.answer_result.source.value!r}, "
+            f"answer={_diagnostic_value(self.answer_result.value)})"
+        )
+
+
+@dataclass(frozen=True, repr=False)
+class WriteResult:
+    status: WriteStatus
+    attempted_value: str | bool | None
+    verified_value: str | bool | None
+    changed: bool
+    retry_count: int
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        if self.retry_count < 0 or self.retry_count > 1:
+            raise ValueError("retry_count must be zero or one")
+
+    def __repr__(self) -> str:
+        return (
+            "WriteResult("
+            f"status={self.status.value!r}, "
+            f"attempted_value={_diagnostic_value(self.attempted_value)}, "
+            f"verified_value={_diagnostic_value(self.verified_value)}, "
+            f"changed={self.changed!r}, retry_count={self.retry_count}, "
+            f"reason_code={self.reason_code!r})"
+        )
+
+
+def _diagnostic_value(value: str | bool | None) -> str:
+    if isinstance(value, bool) or value is None:
+        return repr(value)
+    return f"<text length={len(str(value))}>"
