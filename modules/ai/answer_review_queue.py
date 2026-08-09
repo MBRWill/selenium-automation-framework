@@ -20,6 +20,7 @@ CSV_COLUMNS = (
     "question",
     "field_type",
     "required",
+    "visible_options",
     "visible_options_json",
     "proposed_answer",
     "reason_code",
@@ -80,6 +81,7 @@ class AIAnswerReviewQueue:
         self._high_priority = 0
         self._row_count = 0
         self._application_keys: set[tuple[str, str, str]] = set()
+        self._field_keys: set[tuple[str, str, str, str]] = set()
         timestamp = self._now().strftime("%Y-%m-%d_%H%M%S")
         directory = root or (
             Path(__file__).resolve().parents[2] / "logs" / "ai_answer_review"
@@ -202,6 +204,17 @@ class AIAnswerReviewQueue:
             self._high_priority += 1
         return True
 
+    @staticmethod
+    def _field_key(
+        job_id: str, company: str, field_type: str, question: str
+    ) -> tuple[str, str, str, str]:
+        return (
+            str(job_id or ""),
+            " ".join(str(company or "").casefold().split()),
+            str(field_type or "").casefold(),
+            " ".join(str(question or "").casefold().split()),
+        )
+
     def record_answer(
         self,
         *,
@@ -224,6 +237,9 @@ class AIAnswerReviewQueue:
         reviewer_notes: str = "",
     ) -> bool:
         if provider_request_count <= 0 and not record_without_provider:
+            return False
+        field_key = self._field_key(job_id, company, field_type, question)
+        if field_key in self._field_keys:
             return False
         if application_outcome not in _VALID_OUTCOMES:
             application_outcome = "validation_failed"
@@ -261,6 +277,7 @@ class AIAnswerReviewQueue:
             "question": safe_question,
             "field_type": field_type,
             "required": str(bool(required)).lower(),
+            "visible_options": json.dumps(safe_options, ensure_ascii=False),
             "visible_options_json": json.dumps(safe_options, ensure_ascii=False),
             "proposed_answer": safe_answer,
             "reason_code": reason_code,
@@ -275,6 +292,7 @@ class AIAnswerReviewQueue:
             "reviewer_notes": self._redact_text(reviewer_notes),
         }
         if self._append(row):
+            self._field_keys.add(field_key)
             self._application_keys.add((str(job_id), str(company), str(job_title)))
             return True
         return False
@@ -292,6 +310,9 @@ class AIAnswerReviewQueue:
         validation_result: str = "unresolved_required",
         application_outcome: str = "unresolved_required",
     ) -> bool:
+        field_key = self._field_key(job_id, company, field_type, question)
+        if field_key in self._field_keys:
+            return False
         priority = self._priority(
             field_type=field_type,
             required=True,
@@ -315,6 +336,12 @@ class AIAnswerReviewQueue:
             ),
             "field_type": field_type,
             "required": "true",
+            "visible_options": json.dumps(
+                [] if contact_question else [
+                    self._redact_text(option) for option in (visible_options or [])
+                ],
+                ensure_ascii=False,
+            ),
             "visible_options_json": json.dumps(
                 [] if contact_question else [
                     self._redact_text(option) for option in (visible_options or [])
@@ -334,6 +361,7 @@ class AIAnswerReviewQueue:
             "reviewer_notes": "",
         }
         if self._append(row):
+            self._field_keys.add(field_key)
             self._application_keys.add((str(job_id), str(company), str(job_title)))
             return True
         return False
@@ -377,6 +405,7 @@ class AIAnswerReviewQueue:
             "question": "",
             "field_type": "event",
             "required": "false",
+            "visible_options": "[]",
             "visible_options_json": "[]",
             "proposed_answer": "",
             "reason_code": reason_code,
@@ -400,6 +429,7 @@ class AIAnswerReviewQueue:
             "question": "",
             "field_type": "event",
             "required": "false",
+            "visible_options": "[]",
             "visible_options_json": "[]",
             "proposed_answer": "",
             "reason_code": "run_interrupted",

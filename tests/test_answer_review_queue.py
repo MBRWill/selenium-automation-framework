@@ -54,6 +54,7 @@ class AnswerReviewQueueTests(unittest.TestCase):
         self.assertTrue(self.record_answer(queue))
         row = self.rows(queue)[0]
         self.assertEqual(tuple(row), CSV_COLUMNS)
+        self.assertEqual(row["visible_options"], "[]")
         self.assertEqual(row["review_status"], "pending")
         for field in (
             "corrected_answer",
@@ -193,7 +194,7 @@ class AnswerReviewQueueTests(unittest.TestCase):
         queue = self.queue()
         for reason in (
             "stale_preserved_experience_overridden",
-            "assertive_experience_threshold_yes_default",
+            "ordinary_experience_yes_default",
         ):
             self.record_answer(
                 queue,
@@ -357,7 +358,7 @@ class AnswerReviewQueueTests(unittest.TestCase):
             field_type="radio",
             visible_options=["Yes", "No"],
             proposed_answer="Yes",
-            reason_code="assertive_experience_yes_default",
+            reason_code="ordinary_experience_yes_default",
             provider_request_count=0,
             record_without_provider=True,
         ))
@@ -381,6 +382,35 @@ class AnswerReviewQueueTests(unittest.TestCase):
             rows[1]["reviewer_notes"],
             "original_proposed_answer=0",
         )
+        queue.close()
+
+    def test_yes_default_and_gemini_answers_are_written_once_per_field(self):
+        queue = self.queue()
+        ordinary = {
+            "question": "Do you know an unfamiliar planning tool?",
+            "field_type": "radio",
+            "visible_options": ["Yes", "No"],
+            "proposed_answer": "Yes",
+            "reason_code": "ordinary_experience_yes_default",
+            "provider_request_count": 0,
+            "record_without_provider": True,
+        }
+        self.assertTrue(self.record_answer(queue, **ordinary))
+        self.assertFalse(self.record_answer(queue, **ordinary))
+        self.assertTrue(self.record_answer(
+            queue,
+            question="Describe your working style",
+            proposed_answer="Collaborative",
+            reason_code="grounded_ai_answer",
+            provider_request_count=1,
+        ))
+
+        rows = self.rows(queue)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["reason_code"], "ordinary_experience_yes_default")
+        self.assertEqual(rows[0]["review_status"], "pending")
+        self.assertEqual(rows[0]["corrected_answer"], "")
+        self.assertEqual(rows[1]["reason_code"], "grounded_ai_answer")
         queue.close()
 
     def test_analyst_floor_and_french_language_mapping_are_recorded(self):

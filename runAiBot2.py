@@ -1031,8 +1031,7 @@ def _unknown_answer(label, field_type, options, question, control, job_title, jo
                 else "validation_failed"
             )
             policy_review_required = reason in {
-                "assertive_experience_yes_default",
-                "assertive_experience_threshold_yes_default",
+                "ordinary_experience_yes_default",
                 "analyst_role_years_minimum_floor",
                 "experience_years_minimum_floor",
                 "localized_language_exact_fact",
@@ -1268,6 +1267,10 @@ def _verified_preserved_answer(
     current_answer: str,
     constraints: dict | None = None,
 ):
+    if is_experience_capability_question(label):
+        # For ordinary capability questions, LinkedIn's confirmed/saved value
+        # has first priority. Exact facts and the Yes default apply only when blank.
+        return None
     result = answer_verified_question(
         label, field_type, options, constraints
     )
@@ -1277,13 +1280,6 @@ def _verified_preserved_answer(
         "exact_option_unavailable", "exact_option_not_available"
     }:
         return result
-    if (
-        _is_negative_answer(current_answer)
-        and is_experience_capability_question(label)
-    ):
-        result = answer_deterministic_question(label, field_type, options)
-        if result.can_answer and not _answers_match(current_answer, result.answer):
-            return result
     return None
 
 

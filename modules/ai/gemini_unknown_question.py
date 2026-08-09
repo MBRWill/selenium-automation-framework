@@ -19,7 +19,12 @@ _TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 _CONTACT_WORDS = ("first name", "middle name", "last name", "full name", "email", "phone")
 _PROHIBITED_INFERENCE_WORDS = (
     "citizen", "citizenship", "nationality", "nacionalidad", "nationalite",
-    "ciudadania", "citoyennete", "clearance", "licen", "certif", "legal declaration",
+    "ciudadania", "citoyennete", "work authorization", "work authorisation",
+    "authorized to work", "authorised to work", "right to work", "sponsorship",
+    "visa", "clearance", "licen", "certif",
+    "degree", "diploma", "graduat", "criminal", "felony", "legal declaration",
+    "date of birth", "legal name", "email", "phone", "address", "worked for",
+    "employed by", "current employer", "previous employer", "former employer",
     "privacy", "consent", "disability",
     "veteran", "gender", "ethnicity", "race",
 )
@@ -99,8 +104,11 @@ _EXPERIENCE_YES_PHRASES = (
     "have you had",
     "do you meet the",
     "do you have knowledge",
+    "do you know",
     "are you experienced in",
     "are you familiar with",
+    "are you comfortable using",
+    "are you comfortable with",
     "can you work with",
     "tienes experiencia",
     "tiene experiencia",
@@ -167,6 +175,19 @@ _EXPERIENCE_POLICY_EXCLUSIONS = (
     "degree",
     "graduat",
     "diploma",
+    "date of birth",
+    "full name",
+    "legal name",
+    "email address",
+    "phone number",
+    "home address",
+    "worked for",
+    "employed by",
+    "employment history",
+    "current employer",
+    "previous employer",
+    "former employer",
+    "employment dates",
 )
 _AUTHORIZATION_PHRASES = (
     "legally authorized",
@@ -790,6 +811,13 @@ def is_experience_capability_question(question_text: str) -> bool:
         for phrase in _EXPERIENCE_YES_PHRASES
     ):
         return True
+    if any(re.search(pattern, question) for pattern in (
+        r"\bdo you have\b.*\b(?:experience|knowledge)\b",
+        r"\bhave you\b.*\b(?:worked|used|implemented)\b",
+        r"\bare you\b.*\b(?:familiar|comfortable|experienced)\b",
+        r"\bcan you\b.*\bwork with\b",
+    )):
+        return True
     return _experience_threshold(question) is not None and any(
         marker in question
         for marker in ("experience", "experiencia", "worked", "trabajando")
@@ -809,11 +837,7 @@ def _assertive_experience_yes_answer(
         "Yes",
         field_type,
         options,
-        (
-            "assertive_experience_threshold_yes_default"
-            if _experience_threshold(question) is not None
-            else "assertive_experience_yes_default"
-        ),
+        "ordinary_experience_yes_default",
     )
 
 

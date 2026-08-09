@@ -1293,7 +1293,7 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         assertive = Mock(return_value=SimpleNamespace(
             can_answer=True,
             answer="Yes",
-            reason_code="assertive_experience_yes_default",
+            reason_code="ordinary_experience_yes_default",
             provider_request_count=0,
         ))
         radio = RadioControl("Unknown experience", ["Yes", "No"])
@@ -1442,66 +1442,33 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
                 self.assertIn(selected, call["reviewer_notes"])
                 self.assertFalse(call["force_high_priority"])
 
-    def test_preserved_no_unknown_experience_is_overridden_and_logged(self):
-        cases = (
-            (
-                "¿Tiene experiencia en el sector asegurador?",
-                "assertive_experience_yes_default",
-                ["Sí", "No"],
-                "Sí",
-            ),
-            (
-                "¿Has llevado contabilidades de empresas de forma autónoma?",
-                "assertive_experience_yes_default",
-                ["Yes", "No"],
-                "Yes",
-            ),
-            (
-                "¿Tienes al menos 3 años de experiencia como Business Analyst?",
-                "assertive_experience_threshold_yes_default",
-                ["Yes", "No"],
-                "Yes",
-            ),
-            (
-                "¿Tienes por lo menos 3 años de experiencia trabajando en asesoría como técnico contable?",
-                "assertive_experience_threshold_yes_default",
-                ["Yes", "No"],
-                "Yes",
-            ),
+    def test_saved_ordinary_experience_answer_has_first_priority(self):
+        provider = Mock(side_effect=AssertionError("Gemini must not be called"))
+        verified = Mock(side_effect=AssertionError(
+            "Saved ordinary experience answer must have first priority"
+        ))
+        deterministic = Mock(side_effect=AssertionError(
+            "Yes default must not replace a saved answer"
+        ))
+        review_queue = Mock()
+        question = "Do you have experience with an unfamiliar platform?"
+        field = RadioControl(question, ["Yes", "No"])
+        field.options[1].selected = True
+
+        self.answer(
+            [Question("radio", question, field)],
+            provider,
+            review_queue,
+            verified,
+            deterministic,
         )
-        for question, deterministic_reason, options, expected in cases:
-            with self.subTest(question=question):
-                review_queue = Mock()
-                verified = Mock(return_value=SimpleNamespace(
-                    can_answer=False,
-                    answer="",
-                    reason_code="exact_fact_unavailable",
-                    provider_request_count=0,
-                ))
-                deterministic = Mock(return_value=SimpleNamespace(
-                    can_answer=True,
-                    answer=expected,
-                    reason_code=deterministic_reason,
-                    provider_request_count=0,
-                ))
-                field = RadioControl(question, options)
-                field.options[1].selected = True
-                self.answer(
-                    [Question("radio", question, field)],
-                    Mock(side_effect=AssertionError("Gemini must not be called")),
-                    review_queue,
-                    verified,
-                    deterministic,
-                )
-                self.assertTrue(field.options[options.index(expected)].selected)
-                self.assertFalse(field.options[1].selected)
-                call = review_queue.record_answer.call_args.kwargs
-                self.assertEqual(
-                    call["reason_code"],
-                    "stale_preserved_experience_overridden",
-                )
-                self.assertEqual(call["provider_request_count"], 0)
-                self.assertTrue(call["record_without_provider"])
+
+        self.assertTrue(field.options[1].selected)
+        self.assertFalse(field.options[0].selected)
+        provider.assert_not_called()
+        verified.assert_not_called()
+        deterministic.assert_not_called()
+        review_queue.record_answer.assert_not_called()
 
     def test_exact_threshold_or_negative_no_is_not_overridden(self):
         for reason in ("exact_experience_threshold_fact", "exact_profile_fact"):
@@ -1998,7 +1965,7 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
                 ai = Mock(return_value=SimpleNamespace(
                     can_answer=True,
                     answer=answer,
-                    reason_code="assertive_experience_yes_default",
+                    reason_code="ordinary_experience_yes_default",
                     provider_request_count=0,
                 ))
                 radio = RadioControl(question, options)
@@ -2011,7 +1978,7 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
                 call = review_queue.record_answer.call_args.kwargs
                 self.assertEqual(
                     call["reason_code"],
-                    "assertive_experience_yes_default",
+                    "ordinary_experience_yes_default",
                 )
                 self.assertTrue(call["record_without_provider"])
 

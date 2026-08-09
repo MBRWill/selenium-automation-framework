@@ -385,6 +385,11 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
     def test_unknown_experience_boolean_defaults_yes_without_provider(self):
         for question, options, expected in (
             ("Do you have experience with Data Governance?", ["Yes", "No"], "Yes"),
+            (
+                "Do you have expert-level knowledge of SAP Business One modules related to Finance and Logistics?",
+                ["Yes", "No"],
+                "Yes",
+            ),
             ("¿Tienes experiencia con gobierno de datos?", ["Sí", "No"], "Sí"),
             ("Have you worked with an unfamiliar analytics tool?", ["Oui", "Non"], "Oui"),
         ):
@@ -395,7 +400,7 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
             self.assertEqual(result.answer, expected)
             self.assertEqual(
                 result.reason_code,
-                "assertive_experience_yes_default",
+                "ordinary_experience_yes_default",
             )
             self.assertEqual(result.provider_request_count, 0)
             client_factory.assert_not_called()
@@ -415,12 +420,12 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
             self.assertEqual(result.answer, expected)
             self.assertEqual(
                 result.reason_code,
-                "assertive_experience_yes_default",
+                "ordinary_experience_yes_default",
             )
             self.assertEqual(result.provider_request_count, 0)
             client_factory.assert_not_called()
 
-    def test_exact_negative_skill_precedes_assertive_experience_default(self):
+    def test_confirmed_no_precedes_ordinary_experience_default(self):
         with patch.object(gemini, "OpenAI") as client_factory:
             result = gemini.answer_unknown_question(
                 "Have you used SAP Ariba?",
@@ -465,9 +470,7 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
             self.assertEqual(result.answer, "Yes")
             self.assertEqual(
                 result.reason_code,
-                "assertive_experience_threshold_yes_default"
-                if "3 años" in question
-                else "assertive_experience_yes_default",
+                "ordinary_experience_yes_default",
             )
             self.assertEqual(result.provider_request_count, 0)
             client_factory.assert_not_called()
@@ -528,9 +531,17 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
 
     def test_experience_yes_default_excludes_sensitive_or_factual_questions(self):
         for question in (
+            "Are you authorized to work in Spain?",
+            "Will you need employer sponsorship?",
+            "Are you an EU citizen?",
+            "Do you have a university degree?",
             "Do you have experience requiring employer sponsorship?",
             "Do you have a professional certification?",
             "Do you have a driving licence?",
+            "Do you hold a security clearance?",
+            "Have you ever had a criminal conviction?",
+            "Is your full name Synthetic Person?",
+            "Have you worked for Synthetic Employer?",
         ):
             with self.subTest(question=question), patch.object(gemini, "OpenAI") as client_factory:
                 result = gemini.answer_unknown_question(
@@ -538,7 +549,7 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
                 )
             self.assertNotEqual(
                 result.reason_code,
-                "assertive_experience_yes_default",
+                "ordinary_experience_yes_default",
             )
             client_factory.assert_not_called()
 
