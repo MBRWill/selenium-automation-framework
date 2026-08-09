@@ -171,16 +171,31 @@ class RadioControl(Input):
 
 
 class Question(Input):
-    def __init__(self, kind, label, control, required=True):
+    def __init__(
+        self, kind, label, control, required=True, validation_message=""
+    ):
         super().__init__(attrs={"aria-required": "true" if required else "false"})
         self.kind = kind
         self.label = label
         self.control = control
+        self.validation_message = validation_message
 
     def find_element(self, by, value):
         if by == By.TAG_NAME and value == "label":
             return Label(self.label)
         raise NoSuchElementException()
+
+    def find_elements(self, by, value):
+        if self.validation_message and (
+            "inline-feedback" in value
+            or "error-message" in value
+            or 'role="alert"' in value
+        ):
+            return [SimpleNamespace(
+                text=self.validation_message,
+                is_displayed=lambda: True,
+            )]
+        return []
 
 
 class Modal:
@@ -498,9 +513,12 @@ def load_runtime_functions(
         "_is_overall_experience_question",
         "_browser_control_is_invalid",
         "_question_label",
+        "_linkedin_validation_message",
         "_collect_invalid_required_fields",
+        "_form_page_signature",
         "_fill_repair_field",
         "repair_invalid_required_fields",
+        "_repair_after_failed_advance",
         "_find_job_search_safety_reminder",
         "_close_job_search_safety_reminder",
         "_element_is_visible",
@@ -907,7 +925,7 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         self.assertEqual(call["provider_request_count"], 1)
         self.assertIn("32000 EUR annual", call["reviewer_notes"])
 
-    def test_deferred_numeric_salary_validation_repairs_before_navigation(self):
+    def test_deferred_numeric_salary_validation_repairs_after_failed_navigation(self):
         review_queue = Mock()
         answer = Mock(return_value=SimpleNamespace(
             can_answer=True,
@@ -1012,7 +1030,7 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         namespace = load_runtime_functions(
             provider,
             review_queue,
-            deterministic_mock=deterministic,
+            verified_mock=deterministic,
         )
         field = NumericIntentTextInput("Conversational")
         unresolved = {f"number:{hash('What is your Spanish level? (1–5)')}"}
@@ -1052,7 +1070,7 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         namespace = load_runtime_functions(
             provider,
             review_queue,
-            deterministic_mock=deterministic,
+            verified_mock=deterministic,
         )
         valid = Input("already valid", {"type": "text", "aria-required": "true"})
         invalid = NumericIntentTextInput()
@@ -1078,6 +1096,130 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         self.assertEqual(call["reason_code"], "provider_invalid_field_repair")
         self.assertEqual(call["provider_request_count"], 1)
 
+    def test_successful_advance_does_not_inspect_or_repair(self):
+        namespace = load_runtime_functions(Mock())
+        previous = Modal([Question(
+            "text", "First page question", Input("filled")
+        )])
+        current = Modal([Question(
+            "text", "Second page question", Input("filled")
+        )])
+        before_signature = namespace["_form_page_signature"](previous)
+        inspect_invalid = Mock(side_effect=AssertionError(
+            "Successful navigation must not inspect invalid fields"
+        ))
+        repair = Mock(side_effect=AssertionError(
+            "Successful navigation must not trigger repair"
+        ))
+        namespace["_collect_invalid_required_fields"] = inspect_invalid
+        namespace["repair_invalid_required_fields"] = repair
+
+        result = namespace["_repair_after_failed_advance"](
+            current,
+            before_signature,
+            "Synthetic city",
+            "Synthetic job",
+            "Synthetic description",
+            set(),
+            set(),
+        )
+
+        self.assertIsNone(result)
+        inspect_invalid.assert_not_called()
+        repair.assert_not_called()
+
+    def test_failed_advance_triggers_invalid_field_inspection(self):
+        namespace = load_runtime_functions(Mock())
+        modal = Modal([Question(
+            "text", "Unchanged page question", Input("invalid")
+        )])
+        before_signature = namespace["_form_page_signature"](modal)
+        invalid_fields = [{"kind": "text", "label": "Unchanged page question"}]
+        inspect_invalid = Mock(return_value=invalid_fields)
+        repair = Mock(return_value=True)
+        namespace["_collect_invalid_required_fields"] = inspect_invalid
+        namespace["repair_invalid_required_fields"] = repair
+
+        result = namespace["_repair_after_failed_advance"](
+            modal,
+            before_signature,
+            "Synthetic city",
+            "Synthetic job",
+            "Synthetic description",
+            set(),
+            set(),
+        )
+
+        self.assertTrue(result)
+        inspect_invalid.assert_called_once_with(modal)
+        self.assertIs(repair.call_args.args[-1], invalid_fields)
+
+    def test_linkedin_validation_message_is_collected_with_field_context(self):
+        namespace = load_runtime_functions(Mock())
+        control = Input("bad value", {"type": "text"})
+        fields = namespace["_collect_invalid_required_fields"](Modal([
+            Question(
+                "text",
+                "Validated question",
+                control,
+                required=False,
+                validation_message="Enter a valid value",
+            )
+        ]))
+
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0]["kind"], "text")
+        self.assertEqual(fields[0]["label"], "Validated question")
+        self.assertEqual(fields[0]["current"], "bad value")
+        self.assertEqual(fields[0]["options"], [])
+        self.assertEqual(
+            fields[0]["validation_message"], "Enter a valid value"
+        )
+
+    def test_required_select_and_radio_are_repaired_with_original_operations(self):
+        provider = Mock(side_effect=AssertionError(
+            "Known corrected options must not call Gemini"
+        ))
+        deterministic = Mock(side_effect=lambda label, kind, _options, _constraints: SimpleNamespace(
+            can_answer=True,
+            answer="Second",
+            reason_code="exact_profile_fact",
+            provider_request_count=0,
+        ))
+        namespace = load_runtime_functions(
+            provider, verified_mock=deterministic
+        )
+        select = SelectControl(
+            ["Select an option", "First", "Second"],
+            "Select an option",
+            {"aria-required": "true"},
+        )
+        radio = RadioControl(
+            "Required radio", ["First", "Second"], {"aria-required": "true"}
+        )
+        unresolved = {
+            f"select:{hash('Required select')}",
+            f"radio:{hash('Required radio')}",
+        }
+
+        repaired = namespace["repair_invalid_required_fields"](
+            Modal([
+                Question("select", "Required select", select),
+                Question("radio", "Required radio", radio),
+            ]),
+            "Synthetic city",
+            "Synthetic job",
+            "Synthetic description",
+            unresolved,
+            set(),
+        )
+
+        self.assertTrue(repaired)
+        self.assertEqual(select.selected, "Second")
+        self.assertTrue(radio.options[1].selected)
+        self.assertFalse(unresolved)
+        provider.assert_not_called()
+
     def test_failed_repair_is_high_priority_and_page_cannot_loop(self):
         review_queue = Mock()
         deterministic = Mock(return_value=SimpleNamespace(
@@ -1095,7 +1237,7 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         namespace = load_runtime_functions(
             provider,
             review_queue,
-            deterministic_mock=deterministic,
+            verified_mock=deterministic,
         )
         field = NumericIntentTextInput(always_invalid=True)
         modal = Modal([Question("text", "Numeric level (1-5)", field)])
@@ -1464,7 +1606,7 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         ai.assert_not_called()
         review_queue.record_answer.assert_not_called()
 
-    def test_french_placeholder_is_invalid_and_repaired_before_navigation(self):
+    def test_french_placeholder_is_invalid_and_repaired_after_failed_navigation(self):
         localized = Mock(return_value=SimpleNamespace(
             can_answer=True,
             answer="Natif ou bilingue",
@@ -1475,7 +1617,7 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         namespace = load_runtime_functions(
             Mock(side_effect=AssertionError("Gemini must not be called")),
             review_queue,
-            deterministic_mock=localized,
+            verified_mock=localized,
         )
         field = SelectControl(
             ["Sélectionnez une option", "Courant", "Natif ou bilingue"],
@@ -1970,6 +2112,28 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         self.assertFalse(field.options[0].selected)
         self.assertTrue(field.options[1].selected)
         ai.assert_called_once()
+
+    def test_protected_exact_fact_uses_local_answer_without_gemini(self):
+        provider = Mock(side_effect=AssertionError(
+            "Protected exact facts must never call Gemini"
+        ))
+        exact = Mock(return_value=SimpleNamespace(
+            can_answer=True,
+            answer="No",
+            reason_code="exact_profile_fact",
+            provider_request_count=0,
+        ))
+        field = RadioControl("EU citizenship", ["Yes", "No"])
+
+        self.answer(
+            [Question("radio", "EU citizenship", field)],
+            provider,
+            deterministic_mock=exact,
+        )
+
+        self.assertTrue(field.options[1].selected)
+        exact.assert_called_once()
+        provider.assert_not_called()
 
     def test_authorization_radio_uses_profile_helper_before_stale_config(self):
         ai = Mock(return_value=SimpleNamespace(can_answer=True, answer="Yes", reason_code="exact_profile_fact"))
@@ -2837,20 +3001,60 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
             r"(?m)^\s*(?:return\b|exit\(|driver\.quit)",
         )
 
-    def test_invalid_field_repair_precedes_review_without_help_popup(self):
+    def test_invalid_field_repair_runs_only_after_original_click_fails(self):
         source = RUNTIME.read_text(encoding="utf-8")
         loop = source.index("while next_button:")
         answer = source.index("answer_questions(", loop)
-        repair = source.index("repair_invalid_required_fields(", answer)
-        repair_success = source.index("if page_repaired:", repair)
-        review = source.index(
-            "_final_review_reached_from_submit_button(", repair
+        original_click = source.index("next_button.click()", answer)
+        original_buffer = source.index("buffer(click_gap)", original_click)
+        repair = source.index(
+            "_repair_after_failed_advance(", original_buffer
         )
-        self.assertLess(answer, repair)
-        self.assertLess(repair, repair_success)
-        self.assertLess(repair_success, review)
+        retry_click = source.index("next_button.click()", repair)
+        self.assertLess(answer, original_click)
+        self.assertLess(original_click, original_buffer)
+        self.assertLess(original_buffer, repair)
+        self.assertLess(repair, retry_click)
+        self.assertNotIn(
+            "_collect_invalid_required_fields(",
+            source[answer:original_click],
+        )
         self.assertNotIn("Help Needed", source)
         self.assertNotIn("if pause_at_failed_question:", source)
+
+    def test_repair_retries_the_original_navigation_once(self):
+        source = RUNTIME.read_text(encoding="utf-8")
+        loop_start = source.index("while next_button:")
+        loop_end = source.index(
+            "except NoSuchElementException:\n"
+            "                                safety_detected",
+            loop_start,
+        )
+        loop = source[loop_start:loop_end]
+        repair = loop.index("_repair_after_failed_advance(")
+        retry = loop.index("next_button.click()", repair)
+
+        self.assertEqual(loop.count("next_button.click()"), 2)
+        self.assertIn("if repair_result is True:", loop)
+        self.assertIn("repaired_page_signatures", loop)
+        self.assertLess(repair, retry)
+
+    def test_ai_fallback_does_not_own_submit_or_pagination(self):
+        source = RUNTIME.read_text(encoding="utf-8")
+        unknown = source[
+            source.index("def _unknown_answer("):
+            source.index("def _answers_match(")
+        ]
+        repair = source[
+            source.index("def _linkedin_validation_message("):
+            source.index("# Function to answer the questions for Easy Apply")
+        ]
+        for section in (unknown, repair):
+            self.assertNotIn("Submit application", section)
+            self.assertNotIn("jobs-search-pagination", section)
+            self.assertNotIn("switch_to", section)
+            self.assertNotIn("driver.get", section)
+        self.assertNotIn("next_button.click()", repair)
 
     def test_failed_question_discards_and_continues_without_interaction(self):
         source = RUNTIME.read_text(encoding="utf-8")

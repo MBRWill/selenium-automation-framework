@@ -962,16 +962,20 @@ def _unknown_answer(label, field_type, options, question, control, job_title, jo
     if any(word in label.lower() for word in ("first name", "middle name", "last name", "full name", "email", "phone")):
         answer, reason = None, "contact_field_blocked"
     else:
-        result = answer_unknown_question(
-            label,
-            field_type,
-            options,
-            job_title,
-            job_description or "",
-            text_limit,
-            required=required,
-            constraints=_field_constraints(control),
-        )
+        result = answer_deterministic_question(label, field_type, options)
+        if not result.can_answer and result.reason_code not in {
+            "exact_option_unavailable", "exact_option_not_available"
+        }:
+            result = answer_unknown_question(
+                label,
+                field_type,
+                options,
+                job_title,
+                job_description or "",
+                text_limit,
+                required=required,
+                constraints=_field_constraints(control),
+            )
         answer, reason = (result.answer if result.can_answer else None), result.reason_code
     original_model_answer = str(answer or "").strip()
     numeric_original_answer = ""
@@ -1413,9 +1417,34 @@ def _question_label(question: WebElement, container: WebElement | None = None) -
     return str(getattr(label, "text", "") or "Unknown")
 
 
+def _linkedin_validation_message(question: WebElement) -> str:
+    messages = []
+    validation_xpath = (
+        './/*[contains(@class,"artdeco-inline-feedback__message") '
+        'or contains(@class,"artdeco-inline-feedback") '
+        'or contains(@data-test,"error-message") '
+        'or @role="alert"]'
+    )
+    try:
+        elements = question.find_elements(By.XPATH, validation_xpath)
+    except Exception:
+        elements = []
+    for element in elements:
+        try:
+            if hasattr(element, "is_displayed") and not element.is_displayed():
+                continue
+            message = str(getattr(element, "text", "") or "").strip()
+            if message and message not in messages:
+                messages.append(message)
+        except Exception:
+            continue
+    return " | ".join(messages)
+
+
 def _collect_invalid_required_fields(modal: WebElement) -> list[dict]:
     invalid_fields = []
     for question in modal.find_elements(By.XPATH, ".//div[@data-test-form-element]"):
+        linkedin_message = _linkedin_validation_message(question)
         select_control = try_xp(question, ".//select", False)
         if select_control:
             select = Select(select_control)
@@ -1423,10 +1452,10 @@ def _collect_invalid_required_fields(modal: WebElement) -> list[dict]:
             current = select.first_selected_option.text
             required = _is_required(question, select_control)
             placeholder = _is_select_placeholder(current, select_control)
-            if required and (
-                placeholder
-                or _browser_control_is_invalid(select_control, current, required)
-            ):
+            invalid = _browser_control_is_invalid(
+                select_control, "" if placeholder else current, required
+            )
+            if invalid or linkedin_message:
                 invalid_fields.append({
                     "question": question,
                     "control": select_control,
@@ -1434,6 +1463,7 @@ def _collect_invalid_required_fields(modal: WebElement) -> list[dict]:
                     "label": _question_label(question),
                     "options": options,
                     "current": current,
+                    "validation_message": linkedin_message,
                     "constraints": {
                         name: select_control.get_attribute(name)
                         for name in ("required", "aria-required")
@@ -1461,7 +1491,8 @@ def _collect_invalid_required_fields(modal: WebElement) -> list[dict]:
                 if control.is_selected():
                     current = option_text
             required = _is_required(question, radio)
-            if required and _browser_control_is_invalid(radio, current, required):
+            invalid = _browser_control_is_invalid(radio, current, required)
+            if invalid or linkedin_message:
                 invalid_fields.append({
                     "question": question,
                     "control": radio,
@@ -1470,6 +1501,7 @@ def _collect_invalid_required_fields(modal: WebElement) -> list[dict]:
                     "label": _question_label(question, radio),
                     "options": options,
                     "current": current,
+                    "validation_message": linkedin_message,
                     "constraints": {
                         name: radio.get_attribute(name)
                         for name in ("required", "aria-required")
@@ -1493,7 +1525,8 @@ def _collect_invalid_required_fields(modal: WebElement) -> list[dict]:
                 "number" if kind == "text" and _is_numeric_control(control, label)
                 else kind
             )
-            if required and _browser_control_is_invalid(control, current, required):
+            invalid = _browser_control_is_invalid(control, current, required)
+            if invalid or linkedin_message:
                 invalid_fields.append({
                     "question": question,
                     "control": control,
@@ -1501,6 +1534,7 @@ def _collect_invalid_required_fields(modal: WebElement) -> list[dict]:
                     "label": label,
                     "options": [],
                     "current": current,
+                    "validation_message": linkedin_message,
                     "constraints": {
                         name: control.get_attribute(name)
                         for name in (
@@ -1519,7 +1553,10 @@ def _collect_invalid_required_fields(modal: WebElement) -> list[dict]:
             continue
 
         checkbox = try_xp(question, ".//input[@type='checkbox']", False)
-        if checkbox and _is_required(question, checkbox) and not checkbox.is_selected():
+        if checkbox and (
+            (_is_required(question, checkbox) and not checkbox.is_selected())
+            or linkedin_message
+        ):
             invalid_fields.append({
                 "question": question,
                 "control": checkbox,
@@ -1527,10 +1564,54 @@ def _collect_invalid_required_fields(modal: WebElement) -> list[dict]:
                 "label": _question_label(question),
                 "options": [],
                 "current": "",
+                "validation_message": linkedin_message,
                 "constraints": {"required": checkbox.get_attribute("required")},
                 "validation_category": "required_value_missing",
             })
     return invalid_fields
+
+
+def _form_page_signature(modal: WebElement) -> tuple:
+    signature = []
+    for question in modal.find_elements(By.XPATH, ".//div[@data-test-form-element]"):
+        kind = "unknown"
+        control = try_xp(question, ".//select", False)
+        if control:
+            kind = "select"
+        else:
+            control = try_xp(
+                question,
+                './/fieldset[@data-test-form-builder-radio-button-form-component="true"]',
+                False,
+            )
+            if control:
+                kind = "radio"
+            else:
+                control = try_xp(
+                    question, ".//input[@type='text' or @type='number']", False
+                )
+                if control:
+                    kind = (
+                        "number"
+                        if _is_numeric_control(control, _question_label(question))
+                        else "text"
+                    )
+                else:
+                    control = try_xp(question, ".//textarea", False)
+                    if control:
+                        kind = "textarea"
+                    else:
+                        control = try_xp(
+                            question, ".//input[@type='checkbox']", False
+                        )
+                        if control:
+                            kind = "checkbox"
+        try:
+            control_id = str(control.get_attribute("id") or "") if control else ""
+        except Exception:
+            control_id = ""
+        signature.append((kind, _question_label(question), control_id))
+    return tuple(signature)
 
 
 def _fill_repair_field(field: dict, answer: str) -> bool:
@@ -1572,11 +1653,13 @@ def repair_invalid_required_fields(
     job_description: str,
     unresolved_required: set,
     repaired_page_signatures: set,
+    invalid_fields: list[dict] | None = None,
 ) -> bool:
     """Repair each invalid required field once, with at most one pass per page."""
-    invalid_fields = _collect_invalid_required_fields(modal)
+    if invalid_fields is None:
+        invalid_fields = _collect_invalid_required_fields(modal)
     if not invalid_fields:
-        return not unresolved_required
+        return False
     signature = tuple(
         sorted((field["kind"], field["label"]) for field in invalid_fields)
     )
@@ -1628,7 +1711,9 @@ def repair_invalid_required_fields(
             if answer is not None and answer != current.strip():
                 reason = "numeric_input_normalized"
         if not answer:
-            result = answer_deterministic_question(label, kind, options)
+            result = answer_verified_question(
+                label, kind, options, field["constraints"]
+            )
             if result.can_answer:
                 answer = result.answer
                 if result.reason_code in {
@@ -1648,7 +1733,12 @@ def repair_invalid_required_fields(
                     job_description or "",
                     None,
                     required=True,
-                    constraints=field["constraints"],
+                    constraints={
+                        **field["constraints"],
+                        "validation_message": field.get(
+                            "validation_message", ""
+                        ),
+                    },
                 )
                 if result.can_answer:
                     answer = result.answer
@@ -1711,6 +1801,32 @@ def repair_invalid_required_fields(
                 "validation_failed",
             )
     return all_valid and not unresolved_required
+
+
+def _repair_after_failed_advance(
+    modal: WebElement,
+    before_signature: tuple,
+    work_location: str,
+    job_title: str,
+    job_description: str,
+    unresolved_required: set,
+    repaired_page_signatures: set,
+) -> bool | None:
+    """Repair only when an original Next/Review click left this page in place."""
+    if _form_page_signature(modal) != before_signature:
+        return None
+    invalid_fields = _collect_invalid_required_fields(modal)
+    if not invalid_fields:
+        return None
+    return repair_invalid_required_fields(
+        modal,
+        work_location,
+        job_title,
+        job_description,
+        unresolved_required,
+        repaired_page_signatures,
+        invalid_fields,
+    )
 
 
 # Function to answer the questions for Easy Apply
@@ -3292,23 +3408,6 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                         )
                                     next_counter += 1
                                     questions_list = answer_questions(modal, questions_list, work_location, title, unresolved_required, job_description=description)
-                                    invalid_required = _collect_invalid_required_fields(modal)
-                                    page_repaired = False
-                                    if unresolved_required or invalid_required:
-                                        repaired = repair_invalid_required_fields(
-                                            modal,
-                                            work_location,
-                                            title,
-                                            description,
-                                            unresolved_required,
-                                            repaired_page_signatures,
-                                        )
-                                        if not repaired:
-                                            raise Exception("Required application fields remain unresolved")
-                                        page_repaired = True
-
-                                    if page_repaired:
-                                        next_counter = 1
 
                                     if next_counter >= 15:
                                         if questions_list: print_lg("Stuck for one or some of the following questions...", questions_list)
@@ -3333,11 +3432,29 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                         next_button = modal.find_element(By.XPATH, './/span[normalize-space(.)="Review"]')
                                         reached_review = True
                                     except NoSuchElementException:  next_button = modal.find_element(By.XPATH, './/button[contains(span, "Next")]')
+                                    before_signature = _form_page_signature(modal)
                                     try: 
                                         next_button.click()
 
                                     except ElementClickInterceptedException: break    # Happens when it tries to click Next button in About Company photos section
                                     buffer(click_gap)
+                                    repair_result = _repair_after_failed_advance(
+                                        modal,
+                                        before_signature,
+                                        work_location,
+                                        title,
+                                        description,
+                                        unresolved_required,
+                                        repaired_page_signatures,
+                                    )
+                                    if repair_result is False:
+                                        raise Exception("Required application fields remain unresolved")
+                                    if repair_result is True:
+                                        next_button.click()
+                                        buffer(click_gap)
+                                        if _form_page_signature(modal) == before_signature:
+                                            raise Exception("Required application fields remain unresolved after repair")
+                                        next_counter = 1
 
                             except NoSuchElementException:
                                 safety_detected, safety_closed = (
