@@ -824,6 +824,14 @@ def is_experience_capability_question(question_text: str) -> bool:
     )
 
 
+def is_protected_objective_fact_question(question_text: str) -> bool:
+    question = _matching_normalized(question_text)
+    return any(
+        _matching_normalized(marker) in question
+        for marker in _PROHIBITED_INFERENCE_WORDS
+    )
+
+
 def _assertive_experience_yes_answer(
     question: str,
     field_type: str,
@@ -1748,9 +1756,19 @@ def answer_unknown_question(
         profile, normalized_question, field_type, options
     )
     if exact_profile_answer is not None:
-        return _apply_experience_years_floor(
+        exact_profile_answer = _apply_experience_years_floor(
             exact_profile_answer, question_text, field_type
         )
+        option_mapping_allowed = (
+            required
+            and field_type == "select"
+            and exact_profile_answer.reason_code in {
+                "exact_option_unavailable", "exact_option_not_available"
+            }
+            and not is_protected_objective_fact_question(question_text)
+        )
+        if not option_mapping_allowed:
+            return exact_profile_answer
     exact_language_option_missing = (
         _language_name(normalized_question) in _LANGUAGE_SCALE_VALUES
         and _is_language_level_question(normalized_question)
@@ -1771,11 +1789,7 @@ def answer_unknown_question(
             question_text,
             field_type,
         )
-    prohibited_question = _matching_normalized(question_text)
-    if any(
-        _matching_normalized(word) in prohibited_question
-        for word in _PROHIBITED_INFERENCE_WORDS
-    ):
+    if is_protected_objective_fact_question(question_text):
         return UnknownQuestionAnswer(False, reason_code="high_risk_exact_fact_missing")
     config = load_gemini_config()
     if not config.configured:

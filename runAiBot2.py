@@ -50,6 +50,7 @@ from modules.ai.gemini_unknown_question import (
     answer_verified_question,
     is_experience_capability_question,
     is_citizenship_question,
+    is_protected_objective_fact_question,
 )
 
 from typing import Literal
@@ -963,9 +964,20 @@ def _unknown_answer(label, field_type, options, question, control, job_title, jo
         answer, reason = None, "contact_field_blocked"
     else:
         result = answer_deterministic_question(label, field_type, options)
-        if not result.can_answer and result.reason_code not in {
+        exact_option_unavailable = result.reason_code in {
             "exact_option_unavailable", "exact_option_not_available"
-        }:
+        }
+        option_mapping_allowed = (
+            required
+            and field_type == "select"
+            and exact_option_unavailable
+            and not is_protected_objective_fact_question(label)
+        )
+        if (
+            not result.can_answer
+            and not is_protected_objective_fact_question(label)
+            and (not exact_option_unavailable or option_mapping_allowed)
+        ):
             result = answer_unknown_question(
                 label,
                 field_type,
@@ -1718,9 +1730,20 @@ def repair_invalid_required_fields(
                     "localized_language_exact_fact",
                 }:
                     reason = result.reason_code
-            elif result.reason_code not in {
-                "exact_option_unavailable", "exact_option_not_available"
-            }:
+            else:
+                exact_option_unavailable = result.reason_code in {
+                    "exact_option_unavailable", "exact_option_not_available"
+                }
+                option_mapping_allowed = (
+                    kind == "select"
+                    and exact_option_unavailable
+                    and not is_protected_objective_fact_question(label)
+                )
+            if (
+                not answer
+                and not is_protected_objective_fact_question(label)
+                and (not exact_option_unavailable or option_mapping_allowed)
+            ):
                 result = answer_unknown_question(
                     label,
                     kind,
@@ -1982,9 +2005,30 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                                 break
                         if foundOption: break
                 if not foundOption:
+                    optionsText = [option.text for option in select.options]
                     answer = _unknown_answer(label_org, "select", optionsText, Question, select_element, job_title, job_description, None, unresolved_required)
-                    if answer is not None: select.select_by_visible_text(answer)
-                    else: answer = prev_answer
+                    if answer is not None:
+                        try:
+                            select.select_by_visible_text(answer)
+                            selected_answer = select.first_selected_option.text
+                            if _is_select_placeholder(
+                                selected_answer, select_element
+                            ):
+                                answer = None
+                            else:
+                                answer = selected_answer
+                        except NoSuchElementException:
+                            answer = None
+                    if answer is None:
+                        if _is_required(Question, select_element):
+                            unresolved_required.add(
+                                f"select:{hash(label_org)}"
+                            )
+                        answer = prev_answer
+                    else:
+                        unresolved_required.discard(
+                            f"select:{hash(label_org)}"
+                        )
             questions_list.add(("select", "answered" if answer else "unresolved", "preserved" if prev_answer else "new"))
             continue
         

@@ -605,6 +605,15 @@ def load_runtime_functions(
                 "ciudadan", "nacionalidad", "citoyen", "nationalit",
             )
         ),
+        "is_protected_objective_fact_question": lambda label: any(
+            marker in label.casefold()
+            for marker in (
+                "authorization", "authorisation", "sponsorship", "visa",
+                "citizen", "citizenship", "degree", "certif", "licence",
+                "license", "clearance", "criminal", "legal declaration",
+                "full name", "email", "phone", "worked for", "employed by",
+            )
+        ),
         "ai_answer_review_queue": review_queue,
         "ai_review_context": {
             "job_id": "job-1",
@@ -2071,6 +2080,156 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         field = SelectControl(["Select an option", "First", "Second"], "Select an option")
         self.answer([Question("select", "Preferred working style", field)], ai)
         self.assertEqual(field.selected, "Second")
+
+    def test_required_select_uses_exact_available_option(self):
+        provider = Mock(side_effect=AssertionError("Gemini must not be called"))
+        deterministic = Mock(return_value=SimpleNamespace(
+            can_answer=True,
+            answer="Second",
+            reason_code="exact_profile_fact",
+            provider_request_count=0,
+        ))
+        field = SelectControl(
+            ["Select an option", "First", "Second"],
+            "Select an option",
+            {"aria-required": "true"},
+        )
+
+        unresolved = self.answer(
+            [Question("select", "Exact choice", field)],
+            provider,
+            deterministic_mock=deterministic,
+        )
+
+        self.assertEqual(field.selected, "Second")
+        self.assertFalse(unresolved)
+        provider.assert_not_called()
+
+    def test_required_capability_select_prefers_visible_yes_equivalent(self):
+        for options, expected in (
+            (["Select an option", "Yes", "No"], "Yes"),
+            (["Selecciona una opción", "Sí", "No"], "Sí"),
+        ):
+            with self.subTest(options=options):
+                provider = Mock(side_effect=AssertionError(
+                    "Ordinary Yes preference must be local"
+                ))
+                deterministic = Mock(return_value=SimpleNamespace(
+                    can_answer=True,
+                    answer=expected,
+                    reason_code="ordinary_experience_yes_default",
+                    provider_request_count=0,
+                ))
+                field = SelectControl(
+                    options, options[0], {"aria-required": "true"}
+                )
+
+                unresolved = self.answer(
+                    [Question(
+                        "select", "Do you know the required platform?", field
+                    )],
+                    provider,
+                    deterministic_mock=deterministic,
+                )
+
+                self.assertEqual(field.selected, expected)
+                self.assertFalse(unresolved)
+                provider.assert_not_called()
+
+    def test_unavailable_exact_select_uses_valid_mapped_option_and_logs(self):
+        deterministic = Mock(return_value=SimpleNamespace(
+            can_answer=False,
+            answer="",
+            reason_code="exact_option_unavailable",
+            provider_request_count=0,
+        ))
+        provider = Mock(return_value=SimpleNamespace(
+            can_answer=True,
+            answer="Second Option",
+            reason_code="grounded_ai_answer",
+            provider_request_count=1,
+        ))
+        review_queue = Mock()
+        field = SelectControl(
+            ["Select an option", "First Option", "Second Option"],
+            "Select an option",
+            {"aria-required": "true"},
+        )
+
+        unresolved = self.answer(
+            [Question("select", "Map this required choice", field)],
+            provider,
+            review_queue,
+            deterministic_mock=deterministic,
+        )
+
+        self.assertEqual(field.selected, "Second Option")
+        self.assertFalse(unresolved)
+        provider.assert_called_once()
+        logged = review_queue.record_answer.call_args.kwargs
+        self.assertEqual(logged["proposed_answer"], "Second Option")
+        self.assertEqual(logged["provider_request_count"], 1)
+
+    def test_invalid_or_placeholder_mapped_select_remains_unresolved(self):
+        deterministic = Mock(return_value=SimpleNamespace(
+            can_answer=False,
+            answer="",
+            reason_code="exact_option_unavailable",
+            provider_request_count=0,
+        ))
+        for result in (
+            SimpleNamespace(
+                can_answer=False,
+                answer="",
+                reason_code="invalid_option",
+                provider_request_count=1,
+            ),
+            SimpleNamespace(
+                can_answer=True,
+                answer="Select an option",
+                reason_code="grounded_ai_answer",
+                provider_request_count=1,
+            ),
+        ):
+            with self.subTest(reason=result.reason_code):
+                field = SelectControl(
+                    ["Select an option", "First", "Second"],
+                    "Select an option",
+                    {"aria-required": "true"},
+                )
+                unresolved = self.answer(
+                    [Question("select", "Required mapped choice", field)],
+                    Mock(return_value=result),
+                    deterministic_mock=deterministic,
+                )
+                self.assertTrue(unresolved)
+                self.assertEqual(field.selected, "Select an option")
+
+    def test_protected_select_is_never_approximately_mapped(self):
+        deterministic = Mock(return_value=SimpleNamespace(
+            can_answer=False,
+            answer="",
+            reason_code="exact_option_not_available",
+            provider_request_count=0,
+        ))
+        provider = Mock(side_effect=AssertionError(
+            "Protected facts must not be approximately mapped"
+        ))
+        field = SelectControl(
+            ["Select an option", "Eligible", "Not eligible"],
+            "Select an option",
+            {"aria-required": "true"},
+        )
+
+        unresolved = self.answer(
+            [Question("select", "EU citizenship", field)],
+            provider,
+            deterministic_mock=deterministic,
+        )
+
+        self.assertTrue(unresolved)
+        self.assertEqual(field.selected, "Select an option")
+        provider.assert_not_called()
 
     def test_unknown_radio_does_not_use_first_option_or_authorization(self):
         ai = Mock(return_value=SimpleNamespace(can_answer=True, answer="Second", reason_code="grounded_ai_answer"))

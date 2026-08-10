@@ -1007,6 +1007,50 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
         self.assertEqual(unsafe.reason_code, "exact_option_unavailable")
         client_factory.assert_not_called()
 
+    def test_required_exact_option_unavailable_maps_to_live_option(self):
+        payload = json.dumps({
+            "is_language_question": True,
+            "target_language": "Catalan",
+            "answer": "  professional  ",
+            "confidence": "medium",
+        })
+        client = FakeClient([payload])
+        with patch.object(gemini, "OpenAI", return_value=client):
+            result = gemini.answer_unknown_question(
+                "What is your Catalan proficiency level?",
+                "select",
+                ["Select an option", "Professional", "Native or bilingual"],
+                "Synthetic job",
+                "Synthetic description",
+                None,
+                required=True,
+                constraints={"required": "true"},
+            )
+
+        self.assertTrue(result.can_answer)
+        self.assertEqual(result.answer, "Professional")
+        self.assertEqual(
+            result.reason_code, "multilingual_language_provider_mapping"
+        )
+        self.assertEqual(result.provider_request_count, 1)
+
+    def test_protected_exact_option_unavailable_never_calls_provider(self):
+        with patch.object(gemini, "OpenAI") as client_factory:
+            result = gemini.answer_unknown_question(
+                "Do you hold EU citizenship?",
+                "select",
+                ["Select an option", "Eligible", "Not eligible"],
+                "Synthetic job",
+                "Synthetic description",
+                None,
+                required=True,
+                constraints={"required": "true"},
+            )
+
+        self.assertFalse(result.can_answer)
+        self.assertEqual(result.reason_code, "exact_option_not_available")
+        client_factory.assert_not_called()
+
     def test_explicit_skill_aliases_are_narrow_and_longest_match_wins(self):
         cases = (
             ("Years with Excel?", "7"),
@@ -1116,12 +1160,21 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
             self.assertEqual(result.reason_code, "invalid_number")
 
     def test_select_returns_exact_original_option(self):
-        result, _ = self.call(
-            ['{"can_answer":true,"answer":"  SECOND option ","confidence":"low"}'],
-            "select",
-            ["First option", "Second Option"],
-        )
-        self.assertEqual(result.answer, "Second Option")
+        for answer, options, expected in (
+            ("  SECOND option ", ["First option", "Second Option"], "Second Option"),
+            (" si ", ["Sí", "No"], "Sí"),
+        ):
+            with self.subTest(answer=answer):
+                result, _ = self.call(
+                    [json.dumps({
+                        "can_answer": True,
+                        "answer": answer,
+                        "confidence": "low",
+                    })],
+                    "select",
+                    options,
+                )
+                self.assertEqual(result.answer, expected)
 
     def test_invalid_option_is_rejected(self):
         result, _ = self.call(
