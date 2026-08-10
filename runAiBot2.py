@@ -3134,6 +3134,63 @@ def _guard_next_job_click(browser, job_id: str = "") -> dict:
     }
 
 
+def _wait_for_pagination_overlay_absent(browser) -> bool:
+    for _ in range(10):
+        if not _visible_top_level_overlays(browser):
+            return True
+        sleep(0.2)
+    return not _visible_top_level_overlays(browser)
+
+
+def _cleanup_pagination_overlay(browser) -> bool:
+    """Reuse known-safe Easy Apply cleanup before results pagination."""
+    classification = _classify_visible_overlays(browser)
+    if not classification.get("overlay_count"):
+        return True
+    if classification["success"]:
+        result = _cleanup_confirmed_success_modal(browser)
+    elif classification["abandonment"] or classification["unfinished"]:
+        result = _cleanup_easy_apply_modal(browser)
+    else:
+        return False
+    return bool(
+        result
+        and result.get("success")
+        and _wait_for_pagination_overlay_absent(browser)
+    )
+
+
+def _click_next_results_page(browser) -> str:
+    """Click the original next-page control after bounded safe cleanup."""
+    next_page_xpath = (
+        "//button[contains(@class, 'jobs-search-pagination__button--next') "
+        "and @aria-label='View next page']"
+    )
+    if not _cleanup_pagination_overlay(browser):
+        return "blocked"
+    next_button = browser.find_element(By.XPATH, next_page_xpath)
+    if "artdeco-button--disabled" in next_button.get_attribute("class"):
+        return "disabled"
+    browser.execute_script("arguments[0].scrollIntoView();", next_button)
+    sleep(1)
+    try:
+        next_button.click()
+        return "clicked"
+    except ElementClickInterceptedException:
+        if not _cleanup_pagination_overlay(browser):
+            return "blocked"
+        next_button = browser.find_element(By.XPATH, next_page_xpath)
+        if "artdeco-button--disabled" in next_button.get_attribute("class"):
+            return "disabled"
+        browser.execute_script("arguments[0].scrollIntoView();", next_button)
+        sleep(1)
+        try:
+            next_button.click()
+            return "clicked"
+        except ElementClickInterceptedException:
+            return "blocked"
+
+
 class JobSearchSafetyReminder(Exception):
     """Stop only the current application when LinkedIn shows a safety warning."""
 
@@ -3700,16 +3757,13 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                    # Switching to the next page
                 # Switching to next page
                 try:
-                    next_button = driver.find_element(By.XPATH, "//button[contains(@class, 'jobs-search-pagination__button--next') and @aria-label='View next page']")
-                    
-                    if "artdeco-button--disabled" in next_button.get_attribute("class"):
+                    pagination_result = _click_next_results_page(driver)
+                    if pagination_result == "disabled":
                         print_lg("\n>-> 'Next' button is disabled. Reached the last page!\n")
-                        break 
-                    
-                    driver.execute_script("arguments[0].scrollIntoView();", next_button)  # Ensure it's in view
-                    sleep(1)  # Small delay for stability
-                    next_button.click()
-                    
+                        break
+                    if pagination_result != "clicked":
+                        print_lg("\n⚠️ Blocking modal prevented next-page navigation.\n")
+                        break
                     print_lg("\n>-> Clicked 'Next' button. Moving to the next page...\n")
                     sleep(3)  # Allow time for page to load
                 except NoSuchElementException:

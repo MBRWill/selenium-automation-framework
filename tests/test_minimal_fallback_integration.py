@@ -15,6 +15,10 @@ class NoSuchElementException(Exception):
     pass
 
 
+class ElementClickInterceptedException(Exception):
+    pass
+
+
 class By:
     XPATH = "xpath"
     TAG_NAME = "tag"
@@ -378,6 +382,54 @@ class SyntheticJobCard:
         self.events.append("job-card")
 
 
+class PaginationButton(ClickableButton):
+    def __init__(self, browser, on_click=None):
+        super().__init__(attrs={"class": "jobs-search-pagination__button--next"})
+        self.browser = browser
+        self.on_click = on_click
+        self.click_count = 0
+
+    def click(self):
+        self.click_count += 1
+        if self.on_click is not None:
+            self.on_click(self)
+        self.clicked = True
+        self.browser.events.append("pagination-click")
+
+
+class PaginationBrowser(GenericOverlayBrowser):
+    def __init__(self, overlay=None, easy_modal=None):
+        super().__init__(overlay)
+        self.easy_modal = easy_modal
+        self.events = []
+        self.query_count = 0
+        self.scroll_count = 0
+        self.close_called = False
+        self.quit_called = False
+        self.next_button = PaginationButton(self)
+
+    def find_elements(self, by, xpath):
+        if "jobs-easy-apply-modal" in xpath:
+            return [self.easy_modal] if self.easy_modal is not None else []
+        return super().find_elements(by, xpath)
+
+    def find_element(self, by, xpath):
+        if by != By.XPATH or "View next page" not in xpath:
+            raise NoSuchElementException()
+        self.query_count += 1
+        return self.next_button
+
+    def execute_script(self, script, element):
+        if "scrollIntoView" in script and element is self.next_button:
+            self.scroll_count += 1
+
+    def close(self):
+        self.close_called = True
+
+    def quit(self):
+        self.quit_called = True
+
+
 class SubmitModal(Modal):
     def __init__(self, questions, submit_button, displayed=True):
         super().__init__(questions)
@@ -548,6 +600,9 @@ def load_runtime_functions(
         "_cleanup_easy_apply_modal",
         "_classify_visible_overlays",
         "_guard_next_job_click",
+        "_wait_for_pagination_overlay_absent",
+        "_cleanup_pagination_overlay",
+        "_click_next_results_page",
         "_visible_enabled_submit_button",
         "_final_review_reached_from_submit_button",
         "_record_review_outcome",
@@ -558,6 +613,7 @@ def load_runtime_functions(
         "WebElement": object,
         "By": By,
         "NoSuchElementException": NoSuchElementException,
+        "ElementClickInterceptedException": ElementClickInterceptedException,
         "Select": lambda control: control,
         "try_xp": try_xp,
         "find_by_class": lambda *_: (_ for _ in ()).throw(NoSuchElementException()),
@@ -3014,6 +3070,109 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         self.assertFalse(result["cleanup_needed"])
         self.assertEqual(result["attempt_count"], 0)
         review_queue.record_outcome.assert_not_called()
+
+    def test_no_overlay_keeps_original_pagination_click(self):
+        browser = PaginationBrowser()
+        namespace = load_runtime_functions(Mock())
+
+        result = namespace["_click_next_results_page"](browser)
+
+        self.assertEqual(result, "clicked")
+        self.assertEqual(browser.query_count, 1)
+        self.assertEqual(browser.scroll_count, 1)
+        self.assertEqual(browser.next_button.click_count, 1)
+
+    def test_known_easy_apply_overlay_is_cleaned_before_pagination(self):
+        easy_modal = CleanupDialog(text="Easy Apply")
+        browser = PaginationBrowser(easy_modal=easy_modal)
+        close_button = CleanupButton(
+            "Close",
+            on_click=lambda: setattr(easy_modal, "displayed", False),
+            events=browser.events,
+        )
+        easy_modal.buttons = [close_button]
+        namespace = load_runtime_functions(Mock())
+
+        result = namespace["_click_next_results_page"](browser)
+
+        self.assertEqual(result, "clicked")
+        self.assertEqual(browser.events, ["Close", "pagination-click"])
+        self.assertEqual(browser.query_count, 1)
+
+    def test_intercepted_pagination_click_cleans_requeries_and_retries_once(self):
+        browser = PaginationBrowser()
+
+        def intercept_first(button):
+            if button.click_count == 1:
+                raise ElementClickInterceptedException()
+
+        browser.next_button.on_click = intercept_first
+        namespace = load_runtime_functions(Mock())
+        cleanup = Mock(return_value=True)
+        namespace["_cleanup_pagination_overlay"] = cleanup
+
+        result = namespace["_click_next_results_page"](browser)
+
+        self.assertEqual(result, "clicked")
+        self.assertEqual(cleanup.call_count, 2)
+        self.assertEqual(browser.query_count, 2)
+        self.assertEqual(browser.next_button.click_count, 2)
+
+    def test_unknown_overlay_does_not_click_arbitrary_controls(self):
+        arbitrary = CleanupButton("Continue")
+        unknown_overlay = CleanupDialog(
+            text="Unrelated LinkedIn modal", buttons=[arbitrary]
+        )
+        browser = PaginationBrowser(overlay=unknown_overlay)
+        namespace = load_runtime_functions(Mock())
+
+        result = namespace["_click_next_results_page"](browser)
+
+        self.assertEqual(result, "blocked")
+        self.assertFalse(arbitrary.clicked)
+        self.assertEqual(browser.query_count, 0)
+        self.assertEqual(browser.next_button.click_count, 0)
+
+    def test_successful_retry_uses_original_pagination_flow(self):
+        success_overlay = CleanupDialog(
+            text="Your application was sent", displayed=False
+        )
+        browser = PaginationBrowser(overlay=success_overlay)
+        dismiss = CleanupButton(
+            "Not now",
+            on_click=lambda: setattr(success_overlay, "displayed", False),
+            events=browser.events,
+        )
+        success_overlay.buttons = [dismiss]
+
+        def reveal_stale_overlay(button):
+            if button.click_count == 1:
+                success_overlay.displayed = True
+                raise ElementClickInterceptedException()
+
+        browser.next_button.on_click = reveal_stale_overlay
+        namespace = load_runtime_functions(Mock())
+
+        result = namespace["_click_next_results_page"](browser)
+
+        self.assertEqual(result, "clicked")
+        self.assertEqual(browser.events, ["Not now", "pagination-click"])
+        self.assertEqual(browser.query_count, 2)
+        self.assertEqual(browser.scroll_count, 2)
+
+    def test_pagination_cleanup_never_closes_or_quits_browser(self):
+        easy_modal = CleanupDialog(text="Easy Apply")
+        browser = PaginationBrowser(easy_modal=easy_modal)
+        easy_modal.buttons = [CleanupButton(
+            "Close", on_click=lambda: setattr(easy_modal, "displayed", False)
+        )]
+        namespace = load_runtime_functions(Mock())
+
+        result = namespace["_click_next_results_page"](browser)
+
+        self.assertEqual(result, "clicked")
+        self.assertFalse(browser.close_called)
+        self.assertFalse(browser.quit_called)
 
     def test_visible_enabled_submit_button_marks_final_review(self):
         namespace = load_runtime_functions(Mock())
