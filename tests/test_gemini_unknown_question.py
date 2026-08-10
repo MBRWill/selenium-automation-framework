@@ -543,15 +543,22 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
             "Is your full name Synthetic Person?",
             "Have you worked for Synthetic Employer?",
         ):
-            with self.subTest(question=question), patch.object(gemini, "OpenAI") as client_factory:
-                result = gemini.answer_unknown_question(
-                    question, "radio", ["Yes", "No"], "", "", None
+            with self.subTest(question=question):
+                result, client = self.call(
+                    ['{"can_answer":true,"answer":"No","confidence":"low","reason_code":"grounded_ai_answer"}'],
+                    "radio",
+                    ["Yes", "No"],
+                    question=question,
                 )
             self.assertNotEqual(
                 result.reason_code,
                 "ordinary_experience_yes_default",
             )
-            client_factory.assert_not_called()
+            if result.reason_code == "exact_profile_fact":
+                self.assertEqual(len(client.chat.completions.calls), 0)
+            else:
+                self.assertEqual(result.reason_code, "inferred_objective_fact")
+                self.assertEqual(len(client.chat.completions.calls), 1)
 
     def test_spanish_level_and_confirmed_power_bi_capability_are_exact(self):
         for options, expected in (
@@ -572,7 +579,10 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
             self.assertNotIn(result.answer, {"Professional", "Profesional"})
             client_factory.assert_not_called()
 
-        with patch.object(gemini, "OpenAI") as client_factory:
+        client = FakeClient([
+            '{"can_answer":true,"answer":"Basic","confidence":"low","reason_code":"grounded_ai_answer"}'
+        ])
+        with patch.object(gemini, "OpenAI", return_value=client):
             unsupported = gemini.answer_unknown_question(
                 "What is your Spanish proficiency level?",
                 "select",
@@ -581,9 +591,9 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
                 "",
                 None,
             )
-        self.assertFalse(unsupported.can_answer)
-        self.assertEqual(unsupported.reason_code, "exact_option_unavailable")
-        client_factory.assert_not_called()
+        self.assertTrue(unsupported.can_answer)
+        self.assertEqual(unsupported.answer, "Basic")
+        self.assertEqual(unsupported.reason_code, "ai_option_mapping")
 
         with patch.object(gemini, "OpenAI") as client_factory:
             capability = gemini.answer_unknown_question(
@@ -985,7 +995,10 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
         self.assertEqual(resolution.result.provider_request_count, 2)
 
     def test_catalan_none_maps_only_to_safe_visible_option(self):
-        with patch.object(gemini, "OpenAI") as client_factory:
+        client = FakeClient([
+            '{"can_answer":true,"answer":"Professional","confidence":"low","reason_code":"grounded_ai_answer"}'
+        ])
+        with patch.object(gemini, "OpenAI", return_value=client):
             safe = gemini.answer_unknown_question(
                 "What is your Catalan proficiency level?",
                 "select",
@@ -1003,9 +1016,9 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
                 None,
             )
         self.assertEqual(safe.answer, "None")
-        self.assertFalse(unsafe.can_answer)
-        self.assertEqual(unsafe.reason_code, "exact_option_unavailable")
-        client_factory.assert_not_called()
+        self.assertTrue(unsafe.can_answer)
+        self.assertEqual(unsafe.answer, "Professional")
+        self.assertEqual(unsafe.reason_code, "ai_option_mapping")
 
     def test_required_exact_option_unavailable_maps_to_live_option(self):
         payload = json.dumps({
@@ -1034,8 +1047,12 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
         )
         self.assertEqual(result.provider_request_count, 1)
 
-    def test_protected_exact_option_unavailable_never_calls_provider(self):
-        with patch.object(gemini, "OpenAI") as client_factory:
+    def test_objective_exact_option_unavailable_uses_provider_mapping(self):
+        client = FakeClient([
+            '{"is_language_question":false,"target_language":"","answer":"","confidence":"low"}',
+            '{"can_answer":true,"answer":"Not eligible","confidence":"low","reason_code":"grounded_ai_answer"}',
+        ])
+        with patch.object(gemini, "OpenAI", return_value=client):
             result = gemini.answer_unknown_question(
                 "Do you hold EU citizenship?",
                 "select",
@@ -1047,9 +1064,10 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
                 constraints={"required": "true"},
             )
 
-        self.assertFalse(result.can_answer)
-        self.assertEqual(result.reason_code, "exact_option_not_available")
-        client_factory.assert_not_called()
+        self.assertTrue(result.can_answer)
+        self.assertEqual(result.answer, "Not eligible")
+        self.assertEqual(result.reason_code, "inferred_objective_fact")
+        self.assertEqual(result.provider_request_count, 2)
 
     def test_explicit_skill_aliases_are_narrow_and_longest_match_wins(self):
         cases = (
@@ -1216,14 +1234,15 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
         self.assertEqual(result.provider_request_count, 1)
         self.assertEqual(len(client.chat.completions.calls), 1)
 
-    def test_contact_field_never_constructs_client(self):
-        with patch.object(gemini, "OpenAI") as client_factory:
-            result = gemini.answer_unknown_question(
-                "Email address", "text", [], "", "", None
-            )
-        self.assertFalse(result.can_answer)
-        self.assertEqual(result.reason_code, "contact_field_blocked")
-        client_factory.assert_not_called()
+    def test_unknown_contact_field_uses_best_effort_ai(self):
+        result, client = self.call(
+            ['{"can_answer":true,"answer":"candidate@example.invalid","confidence":"low","reason_code":"grounded_ai_answer"}'],
+            question="Email address",
+        )
+        self.assertTrue(result.can_answer)
+        self.assertEqual(result.answer, "candidate@example.invalid")
+        self.assertEqual(result.reason_code, "inferred_objective_fact")
+        self.assertEqual(len(client.chat.completions.calls), 1)
 
     def test_authorization_paraphrases_bypass_gemini(self):
         for question in (
@@ -1338,16 +1357,80 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
         self.assertIn("strongest defensible answer", prompt)
         self.assertIn("Do not default an unsupported numeric answer to 0", prompt)
 
-    def test_high_risk_without_exact_fact_is_not_inferred(self):
-        with patch.object(gemini, "OpenAI") as client_factory:
-            result = gemini.answer_unknown_question(
-                "Do you hold security clearance?", "radio", ["Yes", "No"], "", "", None
-            )
-        self.assertFalse(result.can_answer)
-        self.assertEqual(result.reason_code, "high_risk_exact_fact_missing")
-        client_factory.assert_not_called()
+    def test_previously_protected_unknown_question_receives_ai_answer(self):
+        result, client = self.call(
+            ['{"can_answer":true,"answer":"Yes","confidence":"low","reason_code":"grounded_ai_answer"}'],
+            "radio",
+            ["Yes", "No"],
+            question="Do you hold security clearance?",
+        )
+        self.assertTrue(result.can_answer)
+        self.assertEqual(result.answer, "Yes")
+        self.assertEqual(result.reason_code, "inferred_objective_fact")
+        self.assertEqual(len(client.chat.completions.calls), 1)
 
-    def test_eu_citizenship_is_not_implied_by_authorization_or_sponsorship(self):
+    def test_missing_degree_fact_does_not_block(self):
+        result, _ = self.call(
+            ['{"can_answer":true,"answer":"No","confidence":"low","reason_code":"grounded_ai_answer"}'],
+            "radio",
+            ["Yes", "No"],
+            question="Do you hold a university degree?",
+        )
+        self.assertTrue(result.can_answer)
+        self.assertEqual(result.answer, "No")
+        self.assertEqual(result.reason_code, "inferred_objective_fact")
+
+    def test_missing_work_authorization_fact_does_not_block(self):
+        self.profile.pop("work_authorization")
+        self.profile_path.write_text(json.dumps(self.profile), encoding="utf-8")
+        result, _ = self.call(
+            ['{"can_answer":true,"answer":"Yes","confidence":"low","reason_code":"grounded_ai_answer"}'],
+            "radio",
+            ["Yes", "No"],
+            question="Are you authorized to work in this country?",
+        )
+        self.assertTrue(result.can_answer)
+        self.assertEqual(result.answer, "Yes")
+        self.assertEqual(result.reason_code, "inferred_objective_fact")
+
+    def test_ai_select_answer_must_match_visible_option(self):
+        result, _ = self.call(
+            ['{"can_answer":true,"answer":" si ","confidence":"low","reason_code":"grounded_ai_answer"}'],
+            "select",
+            ["Sí", "No"],
+            question="Do you hold the required licence?",
+        )
+        self.assertTrue(result.can_answer)
+        self.assertEqual(result.answer, "Sí")
+
+        invalid, _ = self.call(
+            ['{"can_answer":true,"answer":"Maybe","confidence":"low","reason_code":"grounded_ai_answer"}'],
+            "select",
+            ["Yes", "No"],
+            question="Do you hold the required licence?",
+        )
+        self.assertFalse(invalid.can_answer)
+        self.assertEqual(invalid.reason_code, "invalid_option")
+
+    def test_ai_numeric_answer_is_valid_numeric(self):
+        valid, _ = self.call(
+            ['{"can_answer":true,"answer":"12","confidence":"low","reason_code":"grounded_ai_answer"}'],
+            "number",
+            question="How many regulatory filings have you completed?",
+        )
+        self.assertTrue(valid.can_answer)
+        self.assertEqual(valid.answer, "12")
+        self.assertEqual(valid.reason_code, "ai_best_effort_guess")
+
+        invalid, _ = self.call(
+            ['{"can_answer":true,"answer":"about twelve","confidence":"low","reason_code":"grounded_ai_answer"}'],
+            "number",
+            question="How many regulatory filings have you completed?",
+        )
+        self.assertFalse(invalid.can_answer)
+        self.assertEqual(invalid.reason_code, "invalid_number")
+
+    def test_missing_eu_citizenship_uses_best_effort_ai(self):
         self.profile.pop("citizenship")
         self.profile["location"] = {
             "country": "Spain",
@@ -1356,7 +1439,11 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
         self.profile_path.write_text(
             json.dumps(self.profile), encoding="utf-8"
         )
-        with patch.object(gemini, "OpenAI") as client_factory:
+        client = FakeClient([
+            '{"is_language_question":false,"target_language":"","answer":"","confidence":"low"}',
+            '{"can_answer":true,"answer":"No","confidence":"low","reason_code":"grounded_ai_answer"}'
+        ])
+        with patch.object(gemini, "OpenAI", return_value=client):
             result = gemini.answer_unknown_question(
                 "Do you hold a European Citizenship?",
                 "radio",
@@ -1366,10 +1453,10 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
                 None,
                 required=True,
             )
-        self.assertFalse(result.can_answer)
-        self.assertEqual(result.reason_code, "high_risk_exact_fact_missing")
-        self.assertEqual(result.provider_request_count, 0)
-        client_factory.assert_not_called()
+        self.assertTrue(result.can_answer)
+        self.assertEqual(result.answer, "No")
+        self.assertEqual(result.reason_code, "inferred_objective_fact")
+        self.assertEqual(result.provider_request_count, 2)
 
     def test_verified_eu_citizenship_variants_return_exact_no_locally(self):
         questions = (
@@ -1432,8 +1519,12 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
                 self.assertEqual(result.provider_request_count, 0)
                 client_factory.assert_not_called()
 
-    def test_citizenship_missing_visible_option_remains_unresolved(self):
-        with patch.object(gemini, "OpenAI") as client_factory:
+    def test_citizenship_missing_exact_visible_option_uses_ai_mapping(self):
+        client = FakeClient([
+            '{"is_language_question":false,"target_language":"","answer":"","confidence":"low"}',
+            '{"can_answer":true,"answer":"France","confidence":"low","reason_code":"grounded_ai_answer"}',
+        ])
+        with patch.object(gemini, "OpenAI", return_value=client):
             result = gemini.answer_unknown_question(
                 "Country of citizenship",
                 "select",
@@ -1443,20 +1534,20 @@ class GeminiUnknownQuestionTests(unittest.TestCase):
                 None,
                 required=True,
             )
-        self.assertFalse(result.can_answer)
-        self.assertEqual(result.reason_code, "exact_option_not_available")
-        self.assertEqual(result.provider_request_count, 0)
-        client_factory.assert_not_called()
+        self.assertTrue(result.can_answer)
+        self.assertEqual(result.answer, "France")
+        self.assertEqual(result.reason_code, "inferred_objective_fact")
+        self.assertEqual(result.provider_request_count, 2)
 
-    def test_missing_profile_fails_safely(self):
+    def test_missing_profile_still_uses_best_effort_ai(self):
         self.profile_path.unlink()
-        with patch.object(gemini, "OpenAI") as client_factory:
-            result = gemini.answer_unknown_question(
-                "Ordinary question", "text", [], "", "", None
-            )
-        self.assertFalse(result.can_answer)
-        self.assertEqual(result.reason_code, "profile_unavailable")
-        client_factory.assert_not_called()
+        result, client = self.call(
+            ['{"can_answer":true,"answer":"Best effort","confidence":"low","reason_code":"grounded_ai_answer"}']
+        )
+        self.assertTrue(result.can_answer)
+        self.assertEqual(result.answer, "Best effort")
+        self.assertEqual(result.reason_code, "ai_best_effort_guess")
+        self.assertEqual(len(client.chat.completions.calls), 1)
 
     def test_text_is_plain_and_length_bounded(self):
         result, _ = self.call(

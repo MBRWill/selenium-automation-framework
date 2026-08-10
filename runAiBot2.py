@@ -50,7 +50,6 @@ from modules.ai.gemini_unknown_question import (
     answer_verified_question,
     is_experience_capability_question,
     is_citizenship_question,
-    is_protected_objective_fact_question,
 )
 
 from typing import Literal
@@ -959,36 +958,19 @@ def _fill_numeric_control(control: WebElement, value) -> tuple[bool, str]:
 def _unknown_answer(label, field_type, options, question, control, job_title, job_description, text_limit, unresolved_required):
     required = _is_required(question, control)
     key = f"{field_type}:{hash(label)}"
-    result = None
-    if any(word in label.lower() for word in ("first name", "middle name", "last name", "full name", "email", "phone")):
-        answer, reason = None, "contact_field_blocked"
-    else:
-        result = answer_deterministic_question(label, field_type, options)
-        exact_option_unavailable = result.reason_code in {
-            "exact_option_unavailable", "exact_option_not_available"
-        }
-        option_mapping_allowed = (
-            required
-            and field_type == "select"
-            and exact_option_unavailable
-            and not is_protected_objective_fact_question(label)
+    result = answer_deterministic_question(label, field_type, options)
+    if not result.can_answer:
+        result = answer_unknown_question(
+            label,
+            field_type,
+            options,
+            job_title,
+            job_description or "",
+            text_limit,
+            required=required,
+            constraints=_field_constraints(control),
         )
-        if (
-            not result.can_answer
-            and not is_protected_objective_fact_question(label)
-            and (not exact_option_unavailable or option_mapping_allowed)
-        ):
-            result = answer_unknown_question(
-                label,
-                field_type,
-                options,
-                job_title,
-                job_description or "",
-                text_limit,
-                required=required,
-                constraints=_field_constraints(control),
-            )
-        answer, reason = (result.answer if result.can_answer else None), result.reason_code
+    answer, reason = (result.answer if result.can_answer else None), result.reason_code
     original_model_answer = str(answer or "").strip()
     numeric_original_answer = ""
     if answer is not None and _is_numeric_control(control, label):
@@ -1052,6 +1034,10 @@ def _unknown_answer(label, field_type, options, question, control, job_title, jo
                 "multilingual_language_provider_mapping",
                 "numeric_input_normalized",
                 "salary_range_accepted_from_expected_salary",
+                "ai_best_effort_guess",
+                "ai_option_mapping",
+                "inferred_objective_fact",
+                "repair_answer",
             }
             original_answer = str(
                 numeric_original_answer
@@ -1730,20 +1716,7 @@ def repair_invalid_required_fields(
                     "localized_language_exact_fact",
                 }:
                     reason = result.reason_code
-            else:
-                exact_option_unavailable = result.reason_code in {
-                    "exact_option_unavailable", "exact_option_not_available"
-                }
-                option_mapping_allowed = (
-                    kind == "select"
-                    and exact_option_unavailable
-                    and not is_protected_objective_fact_question(label)
-                )
-            if (
-                not answer
-                and not is_protected_objective_fact_question(label)
-                and (not exact_option_unavailable or option_mapping_allowed)
-            ):
+            if not answer:
                 result = answer_unknown_question(
                     label,
                     kind,
@@ -1767,7 +1740,7 @@ def repair_invalid_required_fields(
                             "multilingual_language_numeric_scale",
                             "multilingual_language_provider_mapping",
                         }
-                        else "provider_invalid_field_repair"
+                        else "repair_answer"
                         if int(result.provider_request_count or 0) > 0
                         else "deterministic_invalid_field_repair"
                     )

@@ -17,13 +17,14 @@ from config.questions import (
 _PROFILE_PATH = Path(__file__).resolve().parents[2] / "config" / "candidate_profile.json"
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 _CONTACT_WORDS = ("first name", "middle name", "last name", "full name", "email", "phone")
-_PROHIBITED_INFERENCE_WORDS = (
+_OBJECTIVE_FACT_WORDS = (
     "citizen", "citizenship", "nationality", "nacionalidad", "nationalite",
     "ciudadania", "citoyennete", "work authorization", "work authorisation",
     "authorized to work", "authorised to work", "right to work", "sponsorship",
     "visa", "clearance", "licen", "certif",
     "degree", "diploma", "graduat", "criminal", "felony", "legal declaration",
-    "date of birth", "legal name", "email", "phone", "address", "worked for",
+    "date of birth", "legal name", "full name", "first name", "middle name",
+    "last name", "email", "phone", "address", "worked for",
     "employed by", "current employer", "previous employer", "former employer",
     "privacy", "consent", "disability",
     "veteran", "gender", "ethnicity", "race",
@@ -236,9 +237,9 @@ _ASSERTIVE_ANSWER_POLICY = (
     "Treat a verified supported capability as affirmative rather than defaulting to No. "
     "Do not default an unsupported numeric answer to 0. "
     "For visible choices, select the most positive option that remains supported. "
-    "Use concise, assertive professional wording. Never invent employers, roles, degrees, "
-    "certifications, licences, dates, project names, quantified achievements, revenue, "
-    "percentages, team sizes, or performance metrics."
+    "Use concise, assertive professional wording. When an exact fact is unavailable, choose "
+    "the best-effort field-valid answer from the supplied context and mark it low confidence. "
+    "Do not decline solely because an exact candidate fact is unavailable."
 )
 
 
@@ -495,7 +496,7 @@ def _exact_citizenship_answer(
     facts = _verified_citizenship_facts(profile)
     if facts is None:
         return UnknownQuestionAnswer(
-            False, reason_code="high_risk_exact_fact_missing"
+            False, reason_code="exact_fact_unavailable"
         )
     if kind == "eu_citizenship":
         answer = _local_option_or_text(
@@ -514,7 +515,7 @@ def _exact_citizenship_answer(
         )
     if field_type not in {"select", "radio"}:
         return UnknownQuestionAnswer(
-            False, reason_code="high_risk_exact_fact_missing"
+            False, reason_code="exact_fact_unavailable"
         )
     preferred_keys = (
         ("citizenship_country", "nationality")
@@ -824,11 +825,11 @@ def is_experience_capability_question(question_text: str) -> bool:
     )
 
 
-def is_protected_objective_fact_question(question_text: str) -> bool:
+def is_objective_fact_question(question_text: str) -> bool:
     question = _matching_normalized(question_text)
     return any(
         _matching_normalized(marker) in question
-        for marker in _PROHIBITED_INFERENCE_WORDS
+        for marker in _OBJECTIVE_FACT_WORDS
     )
 
 
@@ -1707,6 +1708,34 @@ def _with_added_provider_requests(
     )
 
 
+def _with_best_effort_reason(
+    result: UnknownQuestionAnswer,
+    question_text: str,
+    field_type: str,
+) -> UnknownQuestionAnswer:
+    if (
+        not result.can_answer
+        or result.provider_request_count <= 0
+        or result.reason_code == "semantic_confirmed_fact"
+    ):
+        return result
+    if is_objective_fact_question(question_text):
+        reason_code = "inferred_objective_fact"
+    elif field_type in {"select", "radio"}:
+        reason_code = "ai_option_mapping"
+    else:
+        reason_code = "ai_best_effort_guess"
+    return UnknownQuestionAnswer(
+        result.can_answer,
+        result.answer,
+        result.confidence,
+        reason_code,
+        result.provider_request_count,
+        result.original_answer,
+        result.target_language,
+    )
+
+
 def answer_unknown_question(
     question_text: str,
     field_type: str,
@@ -1718,7 +1747,7 @@ def answer_unknown_question(
     required: bool = False,
     constraints: dict | None = None,
 ) -> UnknownQuestionAnswer:
-    """Answer one unmatched ordinary question without controlling browser flow."""
+    """Answer one unmatched application question without controlling browser flow."""
     question = _normalized(question_text)
     options = [
         str(option)
@@ -1732,11 +1761,7 @@ def answer_unknown_question(
             "selectionnez une option",
         }
     ]
-    if any(word in question for word in _CONTACT_WORDS):
-        return UnknownQuestionAnswer(False, reason_code="contact_field_blocked")
     profile = _load_profile()
-    if not profile:
-        return UnknownQuestionAnswer(False, reason_code="profile_unavailable")
     salary_range = _salary_range_acceptance_answer(
         profile, question_text, field_type, options
     )
@@ -1759,25 +1784,8 @@ def answer_unknown_question(
         exact_profile_answer = _apply_experience_years_floor(
             exact_profile_answer, question_text, field_type
         )
-        option_mapping_allowed = (
-            required
-            and field_type == "select"
-            and exact_profile_answer.reason_code in {
-                "exact_option_unavailable", "exact_option_not_available"
-            }
-            and not is_protected_objective_fact_question(question_text)
-        )
-        if not option_mapping_allowed:
+        if exact_profile_answer.can_answer:
             return exact_profile_answer
-    exact_language_option_missing = (
-        _language_name(normalized_question) in _LANGUAGE_SCALE_VALUES
-        and _is_language_level_question(normalized_question)
-        and field_type in {"select", "radio"}
-    )
-    if exact_language_option_missing and not required:
-        return UnknownQuestionAnswer(
-            False, reason_code="exact_option_unavailable"
-        )
     assertive_experience_answer = _assertive_experience_yes_answer(
         _phrase_normalized(question_text), field_type, options
     )
@@ -1789,8 +1797,6 @@ def answer_unknown_question(
             question_text,
             field_type,
         )
-    if is_protected_objective_fact_question(question_text):
-        return UnknownQuestionAnswer(False, reason_code="high_risk_exact_fact_missing")
     config = load_gemini_config()
     if not config.configured:
         return _apply_experience_years_floor(
@@ -1818,27 +1824,16 @@ def answer_unknown_question(
         )
     context = _profile_context(profile, question)
     answer_sheet = _confirmed_answer_sheet(profile)
-    if context == "{}" and answer_sheet == "{}":
-        return _apply_experience_years_floor(
-            UnknownQuestionAnswer(
-                False,
-                reason_code="verified_context_unavailable",
-                provider_request_count=language_request_count,
-            ),
-            question_text,
-            field_type,
-        )
     schema = '{"can_answer":true,"answer":"value","confidence":"low|medium|high","reason_code":"semantic_confirmed_fact|grounded_ai_answer"}'
     prompt = (
-        "Answer one career application question using only the supplied confirmed answers and verified facts. "
+        "Answer one career application question using the supplied confirmed answers, verified facts, job context, and best professional judgment. "
         "First decide whether the question is a translation, paraphrase, or alternate wording of a confirmed answer. "
         "If so, reuse that confirmed answer exactly; do not decline, reinterpret, or contradict it, and set "
         "reason_code to semantic_confirmed_fact. This includes authorization, right-to-work, sponsorship, salary, "
         "availability, notice, language, work-arrangement, travel, and exact skill-years concepts. "
-        "Otherwise answer conservatively from verified facts and use grounded_ai_answer. For unsupported specific "
-        "skill years use 0; for unsupported specific Yes/No experience use No. For select/radio return exactly one "
-        "visible option. Decline only if the question is unintelligible or no visible option can be mapped safely. "
-        "Do not invent employers, degrees, certifications, project names, dates, or quantified achievements. "
+        "Otherwise make a best-effort answer and use grounded_ai_answer. Do not decline solely because an exact "
+        "candidate fact is missing. For select/radio return exactly one visible option. "
+        "Decline only if the question is unintelligible or no visible option can be mapped. "
         f"Return only JSON shaped as {schema}.\nField type: {field_type}\n"
         f"Visible options: {json.dumps(options, ensure_ascii=False)}\n"
         f"Question: {question_text[:500]}\nJob title: {job_title[:200]}\n"
@@ -1898,12 +1893,16 @@ def answer_unknown_question(
             field_type,
         )
     return _apply_experience_years_floor(
-        _validate(
-            parsed,
+        _with_best_effort_reason(
+            _validate(
+                parsed,
+                field_type,
+                options,
+                text_limit,
+                provider_request_count,
+            ),
+            question_text,
             field_type,
-            options,
-            text_limit,
-            provider_request_count,
         ),
         question_text,
         field_type,

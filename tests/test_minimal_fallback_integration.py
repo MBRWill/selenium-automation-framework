@@ -605,15 +605,6 @@ def load_runtime_functions(
                 "ciudadan", "nacionalidad", "citoyen", "nationalit",
             )
         ),
-        "is_protected_objective_fact_question": lambda label: any(
-            marker in label.casefold()
-            for marker in (
-                "authorization", "authorisation", "sponsorship", "visa",
-                "citizen", "citizenship", "degree", "certif", "licence",
-                "license", "clearance", "criminal", "legal declaration",
-                "full name", "email", "phone", "worked for", "employed by",
-            )
-        ),
         "ai_answer_review_queue": review_queue,
         "ai_review_context": {
             "job_id": "job-1",
@@ -1102,7 +1093,7 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         self.assertEqual(provider.call_args.args[0], "Unknown numeric rating (1-5)")
         self.assertEqual(provider.call_args.args[1], "number")
         call = review_queue.record_answer.call_args.kwargs
-        self.assertEqual(call["reason_code"], "provider_invalid_field_repair")
+        self.assertEqual(call["reason_code"], "repair_answer")
         self.assertEqual(call["provider_request_count"], 1)
 
     def test_successful_advance_does_not_inspect_or_repair(self):
@@ -2205,16 +2196,20 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
                 self.assertTrue(unresolved)
                 self.assertEqual(field.selected, "Select an option")
 
-    def test_protected_select_is_never_approximately_mapped(self):
+    def test_objective_select_uses_valid_ai_mapping_and_is_reviewed(self):
         deterministic = Mock(return_value=SimpleNamespace(
             can_answer=False,
             answer="",
             reason_code="exact_option_not_available",
             provider_request_count=0,
         ))
-        provider = Mock(side_effect=AssertionError(
-            "Protected facts must not be approximately mapped"
+        provider = Mock(return_value=SimpleNamespace(
+            can_answer=True,
+            answer="Not eligible",
+            reason_code="inferred_objective_fact",
+            provider_request_count=1,
         ))
+        review_queue = Mock()
         field = SelectControl(
             ["Select an option", "Eligible", "Not eligible"],
             "Select an option",
@@ -2224,12 +2219,16 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         unresolved = self.answer(
             [Question("select", "EU citizenship", field)],
             provider,
+            review_queue,
             deterministic_mock=deterministic,
         )
 
-        self.assertTrue(unresolved)
-        self.assertEqual(field.selected, "Select an option")
-        provider.assert_not_called()
+        self.assertFalse(unresolved)
+        self.assertEqual(field.selected, "Not eligible")
+        provider.assert_called_once()
+        logged = review_queue.record_answer.call_args.kwargs
+        self.assertEqual(logged["reason_code"], "inferred_objective_fact")
+        self.assertEqual(logged["proposed_answer"], "Not eligible")
 
     def test_unknown_radio_does_not_use_first_option_or_authorization(self):
         ai = Mock(return_value=SimpleNamespace(can_answer=True, answer="Second", reason_code="grounded_ai_answer"))
@@ -2239,7 +2238,7 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         self.assertTrue(field.options[1].selected)
         ai.assert_called_once()
 
-    def test_protected_exact_fact_uses_local_answer_without_gemini(self):
+    def test_objective_exact_fact_uses_local_answer_without_gemini(self):
         provider = Mock(side_effect=AssertionError(
             "Protected exact facts must never call Gemini"
         ))
@@ -2355,12 +2354,12 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
         self.assertTrue(unresolved)
         self.assertEqual(field.selected, "Select an option")
 
-    def test_eu_citizenship_without_exact_fact_stays_unresolved(self):
+    def test_uncertain_objective_answer_is_queued_and_does_not_block_flow(self):
         ai = Mock(return_value=SimpleNamespace(
-            can_answer=False,
-            answer="",
-            reason_code="high_risk_exact_fact_missing",
-            provider_request_count=0,
+            can_answer=True,
+            answer="Yes",
+            reason_code="inferred_objective_fact",
+            provider_request_count=1,
         ))
         review_queue = Mock()
         field = RadioControl(
@@ -2375,13 +2374,38 @@ class MinimalFallbackIntegrationTests(unittest.TestCase):
             ai,
             review_queue,
         )
-        self.assertTrue(unresolved)
-        self.assertFalse(any(option.selected for option in field.options))
+        self.assertFalse(unresolved)
+        self.assertTrue(field.options[0].selected)
         ai.assert_called_once()
-        event = review_queue.record_required_event.call_args.kwargs
-        self.assertEqual(
-            event["reason_code"], "high_risk_exact_fact_missing"
+        event = review_queue.record_answer.call_args.kwargs
+        self.assertEqual(event["reason_code"], "inferred_objective_fact")
+        self.assertEqual(event["proposed_answer"], "Yes")
+        review_queue.record_required_event.assert_not_called()
+
+    def test_confirmed_objective_answer_takes_priority_over_ai(self):
+        ai = Mock(side_effect=AssertionError("Gemini must not be called"))
+        confirmed = Mock(return_value=SimpleNamespace(
+            can_answer=True,
+            answer="No",
+            reason_code="exact_profile_fact",
+            provider_request_count=0,
+        ))
+        field = RadioControl(
+            "Do you hold a European Citizenship?", ["Yes", "No"]
         )
+        unresolved = self.answer(
+            [Question(
+                "radio",
+                "Do you hold a European Citizenship?",
+                field,
+            )],
+            ai,
+            deterministic_mock=confirmed,
+        )
+        self.assertFalse(unresolved)
+        self.assertTrue(field.options[1].selected)
+        confirmed.assert_called_once()
+        ai.assert_not_called()
 
     def test_verified_eu_citizenship_no_is_filled_and_reviewed_locally(self):
         local_exact = Mock(return_value=SimpleNamespace(
